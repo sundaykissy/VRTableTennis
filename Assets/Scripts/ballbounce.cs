@@ -1,575 +1,547 @@
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
-//using gameplay;
 
-public class ballbounce : MonoBehaviour {
+public class ballbounce : MonoBehaviour
+{
+    // ── Inspector ────────────────────────────────────────────────────────────
+    // enemyPaddle is kept as an Inspector slot so the existing scene reference
+    // compiles cleanly; it is immediately deactivated in gameplay.Start() and
+    // never used during training mode.
+    public GameObject enemyPaddle;
 
-    // Use this for initialization
-
-    public int enemy_score;
-    public int our_score;
-
-    public GameObject player_text;
-
-    public GameObject result_text;
-
-    public static int followPlayer;
-    private string currentCollision;
-
-    public GameObject Ball;
-
+    // ── Statics ──────────────────────────────────────────────────────────────
+    public static int  followPlayer;
     public static bool enemyFlag;
     public static bool resetFlag;
-    public GameObject enemyPaddle;
-    private float time;
 
-    public GameObject cheer_furniture;
-    public GameObject boo_furniture;
-
-    public int serving; //0 playing, 1 player serving, 2 enemy serving
-
+    // ── Game state ───────────────────────────────────────────────────────────
+    // Training mode uses only two states:
+    //   playerStart  — ball in hand, waiting to be served
+    //   playerPaddle — ball in play (bouncing freely)
+    // All scoring / rally states have been removed.
     public enum gameState
     {
-   
-        enemyStart,
         playerStart,
-
-        enemyPaddle,
-        playerPaddle,
-
-        playerSide,
-        enemySide,
-
-        losePoint,
-        winPoint
-
-
+        playerPaddle
     }
-
     public static gameState state;
 
-    private void Start()
+    // ── Physics constants ────────────────────────────────────────────────────
+    //
+    // Unity physics (via PhysicsMaterial on ball + table) now handles the
+    // primary Y-velocity reflection.  These constants control only the spin
+    // contribution applied in OnCollisionEnter.
+    //
+    private const float TABLE_FRICTION = 0.25f;   // spin-to-horizontal transfer
+    private const float SPIN_DECAY     = 0.58f;   // how much spin is lost per bounce
+    private const float BALL_RADIUS    = 0.02f;   // real ping-pong ball radius (m)
+    private const float MAGNUS_COEFF   = 5.5e-6f; // Magnus / topspin lift coefficient
+
+    // ── Net geometry ─────────────────────────────────────────────────────────
+    private const float NET_HEIGHT    = 0.1525f;
+    private const float NET_THICKNESS = 0.025f;
+
+    // ── Private ──────────────────────────────────────────────────────────────
+    private Rigidbody _ballRb;
+    private string    _curCol;
+    private float     _lastBounceTime  = -10f;
+
+    // Velocity-sign bounce detection (FixedUpdate)
+    private float _prevVelY     = 0f;
+    private float _lastBounceY  = -999f; // world Y at last detected bounce
+
+    // ── Audio ─────────────────────────────────────────────────────────────────
+    private AudioSource _audio;
+    private AudioClip   _tableBounceClip;
+    private AudioClip   _floorBounceClip;
+    private AudioClip   _netHitClip;
+
+    // ── Singleton ────────────────────────────────────────────────────────────
+    private static ballbounce _instance;
+    void Awake()
     {
-        state = gameState.playerStart;
-        followPlayer =0;
-        time = -1f;
-        serving = 1;
-        enemyFlag = false;
-        resetFlag = false;
-        enemy_score = 0;
-        our_score = 0;
+        if (_instance != null && _instance != this)
+        {
+            Debug.LogWarning("[ballbounce] Duplicate — destroying: " + gameObject.name);
+            Destroy(gameObject);
+            return;
+        }
+        _instance = this;
+
+        _tableBounceClip = CreatePingClip(820f, 0.055f);
+        _floorBounceClip = CreatePingClip(320f, 0.120f);
+        _netHitClip      = CreatePingClip(480f, 0.100f);
+
+        _audio = GetComponent<AudioSource>();
+        if (_audio == null) _audio = gameObject.AddComponent<AudioSource>();
+        // Fully 2D — VR 3D rolloff makes table-distance sounds inaudible.
+        // spatialBlend=0 means volume is identical wherever the player looks.
+        _audio.spatialBlend = 0f;
+        _audio.rolloffMode  = AudioRolloffMode.Linear;
+        _audio.minDistance  = 1f;
+        _audio.maxDistance  = 500f;
+        _audio.playOnAwake  = false;
+        _audio.mute         = false;
+        _audio.volume       = 1f;
     }
 
-    private void Update()
+    private bool _sessionWasActive = false;
+
+    // ── Start ────────────────────────────────────────────────────────────────
+    void Start()
     {
-        Debug.Log(state);
-        Debug.Log(serving);
+        state        = gameState.playerStart;
+        followPlayer = 0;
+        enemyFlag    = false;
+        resetFlag    = false;
 
-        if (enemy_score >= 12)
+        _ballRb = GetComponent<Rigidbody>();
+        if (_ballRb != null)
         {
-            result_text.GetComponent<UnityEngine.UI.Text>().text = "YOU LOSE :(";
-        }
-        else if (our_score >= 12)
-        {
-            result_text.GetComponent<UnityEngine.UI.Text>().text = "YOU WIN! :)";
-        }
-
-        if (state == gameState.playerStart)
-        {
-            if (gameplay.playerPaddleCollision == 1)
+            _ballRb.useGravity = false;
+            // Only write velocity while non-kinematic — guard against scene-saved kinematic state.
+            if (!_ballRb.isKinematic)
             {
-                state = gameState.playerPaddle;
-                gameplay.playerPaddleCollision = 0;
+                _ballRb.linearVelocity  = Vector3.zero;
+                _ballRb.angularVelocity = Vector3.zero;
             }
-            enemyFlag = false;
-            resetFlag = true;
         }
 
-        else if (state == gameState.enemyStart)
+        // ── Fix trigger sphere radius ─────────────────────────────────────────
+        // The scene has two SphereColliders on the ball:
+        //   solid   radius=0.5  (physics bounce — Unity handles this)
+        //   trigger radius=1.5  (state machine events — us)
+        //
+        // The trigger was 3× the solid radius, so OnTriggerEnter was firing
+        // when the ball was still 3× ball-width ABOVE the surface — causing the
+        // manual bounce code to run at the wrong time.
+        //
+        // We shrink the trigger to just 2% larger than the solid sphere so both
+        // fire simultaneously, and the event is usable for state/audio only.
+        //
+        SphereCollider solidSphere   = null;
+        SphereCollider triggerSphere = null;
+        foreach (var sc in GetComponents<SphereCollider>())
         {
-            Debug.Log("WAITING");
-            if (time == -1f)
-            {
-                time = Time.time;
-            }
-            else if (Time.time - time > 2f)
-            {
-                //serve
-                Debug.Log("SERVING");
-                Ball.transform.position = enemyPaddle.transform.position + new Vector3(0, 0.3f, -0.15f);
-                Ball.GetComponent<Rigidbody>().linearVelocity = new Vector3(0, 0, -3);
-                time = -1f;
-                state = gameState.enemyPaddle;
-            }
-
-
-            if (gameplay.enemyPaddleCollision == 1)
-            {
-                state = gameState.enemyStart;
-                gameplay.enemyPaddleCollision = 0;
-            }
-            enemyFlag = false;
-            resetFlag = true;
+            if (sc.isTrigger) triggerSphere = sc;
+            else              solidSphere   = sc;
+        }
+        if (solidSphere != null && triggerSphere == null)
+        {
+            // No trigger sphere exists in the scene — add one at runtime.
+            // OnTriggerEnter (state machine, table sounds, net detection) relies
+            // on this collider; without it, all those callbacks are silent.
+            triggerSphere           = gameObject.AddComponent<SphereCollider>();
+            triggerSphere.isTrigger = true;
+            triggerSphere.radius    = solidSphere.radius * 1.02f;
+            Debug.Log($"[ballbounce] AUTO-ADDED trigger sphere radius={triggerSphere.radius:F3} " +
+                      $"(solid={solidSphere.radius:F3}) — add a trigger SphereCollider " +
+                      $"in the Inspector to suppress this message.");
+        }
+        else if (solidSphere != null && triggerSphere != null)
+        {
+            triggerSphere.radius = solidSphere.radius * 1.02f;
+            Debug.Log($"[ballbounce] Trigger sphere fixed: {triggerSphere.radius:F3} " +
+                      $"(solid={solidSphere.radius:F3})");
         }
 
-        else if (state == gameState.playerPaddle)
+        // ── Apply physics material to ball ────────────────────────────────────
+        // Bounciness 0.88 matches real TT ball (COR ~0.88).
+        // Maximum combine: the higher value across both surfaces wins, so the
+        // ball's material dominates regardless of what the table has.
+        if (solidSphere != null)
         {
-            
-            if (gameplay.playerPaddleCollision == 1)
-            {
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.playerPaddle;
-                }
-                else
-                {
-                    state = gameState.playerPaddle;
-                }
-                
-                gameplay.playerPaddleCollision = 0;
-            }
-            else if (gameplay.enemyPaddleCollision == 1)
-            {
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.losePoint;
-                }
-                else
-                {
-                    state = gameState.winPoint;
-                }
-                gameplay.enemyPaddleCollision = 0;
-            }
-            if (serving == 2)
-            {
-                serving = 0;
-            }
-            enemyFlag = false;
-            resetFlag = false;
+            var ballMat = new PhysicsMaterial("Ball");
+            ballMat.bounciness      = 0.88f;
+            ballMat.dynamicFriction = 0.08f;
+            ballMat.staticFriction  = 0.08f;
+            ballMat.bounceCombine   = PhysicsMaterialCombine.Minimum;
+            ballMat.frictionCombine = PhysicsMaterialCombine.Minimum;
+            solidSphere.material    = ballMat;
         }
 
-        else if (state == gameState.enemyPaddle)
-        {
-            
-            if (gameplay.playerPaddleCollision == 1)
-            {
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.winPoint;
-                }
-                else
-                {
-                    state = gameState.losePoint;
-                }
+        // ── Apply physics material to table and floor ─────────────────────────
+        // Table: real TT table COR ≈ 0.76.  With Maximum combine the ball's
+        // 0.88 already wins, but having an explicit material prevents Unity's
+        // default material (bounciness=0) from being used as a tiebreaker.
+        ApplyEnvironmentMaterials();
 
-                gameplay.playerPaddleCollision = 0;
-            }
-            else if (gameplay.enemyPaddleCollision == 1)
-            {
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.enemyPaddle;
-                }
-                else
-                {
-                    state = gameState.enemyPaddle;
-                }
-                gameplay.enemyPaddleCollision = 0;
-            }
-            if (serving == 1)
-            {
-                serving = 0;
-            }
-            enemyFlag = false;
-            resetFlag = false;
+        ParkBallUnderground();
+        BuildNetTrigger();
+    }
+
+    // Assign physics materials to table and floor so Unity's solver uses
+    // the correct COR without any manual velocity manipulation.
+    void ApplyEnvironmentMaterials()
+    {
+        // Table surface: medium bounciness — ball's 0.88 wins via Maximum combine
+        var tableMat = new PhysicsMaterial("Table");
+        tableMat.bounciness      = 0.76f;
+        tableMat.dynamicFriction = 0.22f;
+        tableMat.staticFriction  = 0.22f;
+        tableMat.bounceCombine   = PhysicsMaterialCombine.Minimum;
+        tableMat.frictionCombine = PhysicsMaterialCombine.Minimum;
+
+        // Floor: less bouncy than table (hardwood/carpet = lower COR)
+        var floorMat = new PhysicsMaterial("Floor");
+        floorMat.bounciness      = 0.55f;
+        floorMat.dynamicFriction = 0.40f;
+        floorMat.staticFriction  = 0.40f;
+        floorMat.bounceCombine   = PhysicsMaterialCombine.Minimum;
+        floorMat.frictionCombine = PhysicsMaterialCombine.Minimum;
+
+        foreach (string surfaceName in new[] { "playerside", "enemyside" })
+        {
+            GameObject go = GameObject.Find(surfaceName);
+            if (go == null) continue;
+            foreach (var col in go.GetComponents<Collider>())
+                if (!col.isTrigger) col.material = tableMat;
+        }
+        {
+            GameObject go = GameObject.Find("floor");
+            if (go != null)
+                foreach (var col in go.GetComponents<Collider>())
+                    if (!col.isTrigger) col.material = floorMat;
         }
 
-        else if (state == gameState.playerSide)
+        Debug.Log("[ballbounce] Physics materials applied to table and floor.");
+    }
+
+    // ── Ball park/show ────────────────────────────────────────────────────────
+    //
+    // Called ONLY from explicit serve-reset paths:
+    //   • gameplay.cs trigger-press serve-reset (!inPlayerStart && triggerHeld)
+    //   • Session start (first activation)
+    //   • DoAIServe (teleport to AI paddle position)
+    //
+    // NOT called on scoring — scoring uses pointJustScored flag instead so
+    // the ball keeps bouncing naturally after a point.
+    //
+    void ParkBallUnderground()
+    {
+        Debug.Log($"[ballbounce] ParkBallUnderground called — state={state}");
+        if (_ballRb != null)
         {
-
-            if (gameplay.playerPaddleCollision == 1)
+            if (!_ballRb.isKinematic)
             {
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.playerPaddle;
-                }
-                else
-                {
-                    state = gameState.playerPaddle;
-                }
+                _ballRb.linearVelocity  = Vector3.zero;
+                _ballRb.angularVelocity = Vector3.zero;
+            }
+            _ballRb.isKinematic = true;
+            _ballRb.useGravity  = false;
+        }
+        transform.position = new Vector3(0f, -100f, 0f);
+    }
 
-                gameplay.playerPaddleCollision = 0;
-            }
-            else if (gameplay.enemyPaddleCollision == 1)
-            {
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.winPoint;
-                }
-                else
-                {
-                    state = gameState.enemyPaddle; //UNDEF
-                }
-                gameplay.enemyPaddleCollision = 0;
-            }
-            enemyFlag = false;
-            resetFlag = false;
+    // ── Net trigger ───────────────────────────────────────────────────────────
+    void BuildNetTrigger()
+    {
+        GameObject ps = GameObject.Find("playerside");
+        GameObject es = GameObject.Find("enemyside");
+        if (ps == null || es == null)
+        {
+            Debug.LogWarning("[ballbounce] Table sides not found — net skipped.");
+            return;
         }
 
-        else if (state == gameState.enemySide)
+        Collider psCol  = ps.GetComponent<Collider>();
+        float tableTopY = psCol != null ? psCol.bounds.max.y
+                        : ps.transform.position.y + ps.transform.localScale.y * 0.5f;
+        float netZ      = (ps.transform.position.z + es.transform.position.z) * 0.5f;
+        float netX      = (ps.transform.position.x + es.transform.position.x) * 0.5f;
+        float tblWidth  = psCol != null ? psCol.bounds.size.x : ps.transform.localScale.x;
+
+        GameObject netGO = new GameObject("Net");
+        netGO.transform.position = new Vector3(netX, tableTopY + NET_HEIGHT * 0.5f, netZ);
+        BoxCollider nb = netGO.AddComponent<BoxCollider>();
+        nb.isTrigger   = true;
+        nb.size        = new Vector3(tblWidth + 0.4f, NET_HEIGHT, NET_THICKNESS);
+
+        Debug.Log($"[ballbounce] Net z={netZ:F2} tableTop={tableTopY:F2}");
+    }
+
+    // ── Procedural audio ──────────────────────────────────────────────────────
+    static AudioClip CreatePingClip(float frequency, float duration)
+    {
+        const int sampleRate = 44100;
+        int   samples = Mathf.RoundToInt(sampleRate * duration);
+        float[] data  = new float[samples];
+        for (int i = 0; i < samples; i++)
         {
+            float t   = (float)i / sampleRate;
+            float env = Mathf.Exp(-t * 38f);
+            data[i]   = env * Mathf.Sin(2f * Mathf.PI * frequency * t);
+        }
+        var clip = AudioClip.Create("Ping_" + (int)frequency, samples, 1, sampleRate, false);
+        clip.SetData(data, 0);
+        return clip;
+    }
 
-            if (gameplay.playerPaddleCollision == 1)
-            {
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.losePoint;
-                }
-                else
-                {
-                    state = gameState.playerPaddle; //UNDEF
-                }
+    // ── FixedUpdate: Magnus lift + velocity-sign bounce sound detection ───────
+    void FixedUpdate()
+    {
+        if (_ballRb == null) return;
+        if (_ballRb.isKinematic)
+        {
+            _prevVelY = 0f;
+            return;
+        }
 
-                gameplay.playerPaddleCollision = 0;
-            }
-            else if (gameplay.enemyPaddleCollision == 1)
-            {
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.enemyPaddle;
-                }
-                else
-                {
-                    state = gameState.enemyPaddle;
-                }
-                gameplay.enemyPaddleCollision = 0;
-            }
-            if(serving == 0 || serving == 1)
-            {
-                enemyFlag = true;
-                resetFlag = false;
-            }
+        float velY = _ballRb.linearVelocity.y;
+
+        // ── Velocity-sign bounce detection ────────────────────────────────────
+        // When Y-velocity flips from negative (falling) to positive (rising),
+        // the ball just bounced off a surface.  This fires regardless of
+        // collider names, trigger setup, or collision detection mode.
+        if (_prevVelY < -0.8f && velY > 0.1f)
+        {
+            float ballY   = _ballRb.position.y;
+            float impactSpd = Mathf.Abs(_prevVelY);   // speed at impact
+
+            // Classify surface by height.
+            // Table surface is roughly 0.76 m in the scene; floor is near 0.
+            // Use 0.4 m as the split: above = table, below = floor.
+            bool isTableHeight = ballY > 0.4f;
+
+            Debug.Log($"[ballbounce] BounceDetected y={ballY:F2} prevVelY={_prevVelY:F2} " +
+                      $"velY={velY:F2} surface={(isTableHeight ? "TABLE" : "FLOOR")}");
+
+            if (isTableHeight)
+                PlaySound(_tableBounceClip, impactSpd, "TABLE");
             else
-            {
+                PlaySound(_floorBounceClip, impactSpd, "FLOOR");
+
+            _lastBounceY = ballY;
+        }
+
+        _prevVelY = velY;
+
+        // ── Magnus lift ───────────────────────────────────────────────────────
+        if (!ExperimentLogger.SessionActive) return;
+        _ballRb.AddForce(
+            MAGNUS_COEFF * Vector3.Cross(_ballRb.angularVelocity, _ballRb.linearVelocity),
+            ForceMode.Force);
+    }
+
+    // ── OnCollisionEnter: primary audio path for all surface contacts ────────
+    //
+    // This fires on the ball's SOLID-sphere collider making contact.
+    // It is more reliable than OnTriggerEnter for sound because it doesn't
+    // depend on the trigger sphere size or overlap timing.
+    //
+    // AUDIO ONLY — velocity is never modified here.  The PlaySound() cooldown
+    // (_lastBounceTime, 0.04 s) prevents double-play when both this callback
+    // and OnTriggerEnter fire in the same step.
+    private int _collisionLogCount = 0;
+    void OnCollisionEnter(Collision col)
+    {
+        if (_audio == null) return;
+        string name = col.gameObject.name.ToLowerInvariant();
+        // Paddle handled separately by gameplay.cs — don't duplicate.
+        if (name.Contains("paddle") || name.Contains("hand")) return;
+
+        float spd = col.relativeVelocity.magnitude;
+
+        // Diagnostic: log the first 10 collision contacts.
+        if (_collisionLogCount < 10)
+        {
+            Debug.Log($"[ballbounce] OnCollisionEnter #{_collisionLogCount}: " +
+                      $"collider='{col.gameObject.name}' spd={spd:F2}");
+            _collisionLogCount++;
+        }
+
+        if (spd < 0.15f) return;   // ignore true micro-contacts only
+
+        bool isTable = name.Contains("side") || name.Contains("table");
+        bool isFloor = name.Contains("floor") || name.Contains("ground")
+                    || name.Contains("terrain");
+        // Any unrecognised non-prop surface (wall, etc.) — treat as floor sound
+        // rather than staying silent.  Walls/chair-legs tend to be very low-speed
+        // contacts and are already filtered by the 0.15 m/s threshold above.
+        bool isUnknown = !isTable && !isFloor
+                      && !name.Contains("wall") && !name.Contains("chair")
+                      && !name.Contains("ceiling") && !name.Contains("net");
+
+        if      (isTable)   PlaySound(_tableBounceClip, spd, "TABLE_col");
+        else if (isFloor)   PlaySound(_floorBounceClip, spd, "FLOOR_col");
+        else if (isUnknown) PlaySound(_tableBounceClip, spd * 0.5f, "UNKNOWN_col");
+    }
+
+    private int _debugLog = 0;
+
+    // ── State machine (Update) ────────────────────────────────────────────────
+    void Update()
+    {
+        _debugLog++;
+
+        if (!ExperimentLogger.SessionActive)
+        {
+            _sessionWasActive = false;
+            return;
+        }
+
+        if (!_sessionWasActive)
+        {
+            _sessionWasActive = true;
+            ParkBallUnderground();
+            Debug.Log("[ballbounce] Session active — waiting for trigger.");
+        }
+
+        switch (state)
+        {
+            case gameState.playerStart:
+                enemyFlag = false;
+                resetFlag = true;
+                // serveReady is set false at toss and true after 0.4 s by gameplay.cs.
+                // This prevents a stale playerPaddleCollision flag (from the previous
+                // rally) or a phantom hit from toss arm-motion from triggering the
+                // playerStart → playerPaddle transition before the ball is in play.
+                if (gameplay.playerPaddleCollision == 1)
+                {
+                    gameplay.playerPaddleCollision = 0;
+                    if (gameplay.serveReady)
+                    {
+                        state = gameState.playerPaddle;
+                        Debug.Log("[ballbounce] Serve hit → ball in play.");
+                    }
+                    else
+                    {
+                        Debug.Log("[ballbounce] playerPaddleCollision ignored — serveReady=false (debounce).");
+                    }
+                }
+                break;
+
+            case gameState.playerPaddle:
                 enemyFlag = false;
                 resetFlag = false;
-            }
-            
+                // Clear stale paddle collision flags; no scoring logic.
+                if (gameplay.playerPaddleCollision == 1) gameplay.playerPaddleCollision = 0;
+                if (gameplay.enemyPaddleCollision  == 1) gameplay.enemyPaddleCollision  = 0;
+                break;
         }
     }
 
+    // ── OnTriggerEnter — fired by the TRIGGER SphereCollider ─────────────────
+    //
+    // *** DO NOT MODIFY linearVelocity HERE ***
+    //
+    // The trigger sphere overlaps table/floor solid colliders.
+    // Unity's physics engine handles the actual bounce through PhysicsMaterial.
+    // Modifying velocity here would fight the physics solver (double-bounce).
+    // Training mode: this callback handles AUDIO + LOGGING only.
+    // No scoring, no state transitions based on surface contacts.
+    //
+    // Count triggers seen — used to emit a one-time diagnostic log so the user
+    // can verify the exact collider names without flooding the log.
+    private int _triggerLogCount = 0;
 
-    private void OnTriggerEnter(Collider collision)
+    void OnTriggerEnter(Collider col)
     {
-        //Bounce(collision.contacts[0].normal);
-        currentCollision = collision.gameObject.name;
+        // Ball is kinematic while held in the player's hand — ignore all geometry
+        // overlaps during that phase.  Without this guard the playerside collider
+        // (which the hand sits inside at table height) fires spurious table-contact
+        // sounds and logger events on every frame.
+        if (_ballRb != null && _ballRb.isKinematic) return;
 
-        AudioSource audioData = GetComponent<AudioSource>();
+        _curCol = col.gameObject.name;
 
-        AudioSource audio_cheer = cheer_furniture.GetComponent<AudioSource>();
-
-        if (state == gameState.playerStart)
+        // Diagnostic: log the first 10 unique collider names so the developer
+        // can verify that "playerside" / "enemyside" / "floor" match the scene.
+        if (_triggerLogCount < 10)
         {
-            followPlayer = 0;
-            if (currentCollision == "playerside")
-            {
-                state = gameState.playerStart;
-            }
-            else if (currentCollision == "enemyside")
-            {
-                state = gameState.playerStart;
-            }
-            else if (currentCollision == "floor")
-            {
-                state = gameState.playerStart;
-            }
-            else if (currentCollision == "Paddle"  || gameplay.playerPaddleCollision == 1)
-            {
-                state = gameState.playerPaddle;
-                gameplay.playerPaddleCollision = 0;
-            }
-            else if (currentCollision == "EnemyPaddle")
-            {
-                state = gameState.playerStart;
-            }
+            Debug.Log($"[ballbounce] OnTriggerEnter #{_triggerLogCount}: " +
+                      $"collider='{_curCol}' layer={col.gameObject.layer} " +
+                      $"isTrigger={col.isTrigger}");
+            _triggerLogCount++;
         }
 
-        else if (state == gameState.playerPaddle)
+        // Audio plays regardless of session state — sounds should never be
+        // silenced by experiment state (they are part of the core game feel).
+        // State-machine transitions below ARE gated on SessionActive.
+
+        // ── Table contacts: audio + spin transfer + logging ──────────────────
+        // Name check is case-insensitive so scene objects named "PlayerSide" or
+        // "Enemyside" etc. still fire correctly.  If your objects have different
+        // names you will see them in the diagnostic log above.
+        string nameLower = _curCol.ToLowerInvariant();
+        bool isTable = nameLower == "playerside" || nameLower == "enemyside"
+                    || nameLower.Contains("playerside") || nameLower.Contains("enemyside");
+        if (isTable && _ballRb != null)
         {
-            followPlayer = 0;
-            audioData.Play(0);
-            Debug.Log("Hit Player Paddle");
-            
-            if (currentCollision == "playerside")
-            {
-                if(serving == 1 || serving == 2)
-                {
-                    state = gameState.playerSide;
-                }
-                else
-                {
-                    state = gameState.losePoint;
-                }
-            }
-            else if (currentCollision == "enemyside")
-            {
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.losePoint;
-                }
-                else
-                {
-                    state = gameState.enemySide;
-                }
-            }
-            else if(currentCollision == "floor")
-            {
-                state = gameState.losePoint;
-            }
-            else if(currentCollision == "Paddle"  || gameplay.playerPaddleCollision == 1)
-            {
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.playerPaddle;
-                }
-                else
-                {
-                    state = gameState.playerPaddle;
-                }
-                gameplay.playerPaddleCollision = 0;
-            }
-            else if (currentCollision == "EnemyPaddle")
-            {
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.losePoint;
-                }
-                else
-                {
-                    state = gameState.winPoint;
-                }
-            }
-            if (serving == 2)
-            {
-                serving = 0; //playing
-            }
+            float spd = _ballRb.linearVelocity.magnitude;
+
+            // Compute actual ball penetration depth below the table surface.
+            // tableTopY = top face of the collider we just entered.
+            // Ideal contact: ball center is exactly BALL_RADIUS above tableTopY.
+            // Penetration = how far below that ideal the ball center currently is.
+            //   Positive = ball center sank below (tableTopY − BALL_RADIUS).
+            //   ~0       = perfect surface contact (no physics lag).
+            //   Negative = ball bounced early (centre still above surface — rare).
+            ExperimentLogger.Instance?.LogTableContact(
+                _curCol, spd, _ballRb.angularVelocity.magnitude);
+            PlaySound(_tableBounceClip, spd, "TABLE_trig");
+
+            // ── Spin-to-velocity transfer at table contact ────────────────────
+            //
+            // Physics of the spin kick:
+            //   Surface velocity of ball at contact = Cross(omega, r_contact)
+            //   r_contact = (0, -BALL_RADIUS, 0)  (ball center → table)
+            //
+            //   Table friction opposes the surface motion → reaction on ball CM
+            //   is in the OPPOSITE direction to the surface velocity:
+            //     spinKick = -Cross(omega, (0, -R, 0)) × TABLE_FRICTION
+            //
+            // Result by component:
+            //   Topspin  (omega.x > 0, rolling forward): +Z kick (ball kicks forward) ✓
+            //   Backspin (omega.x < 0):                  -Z kick (ball checks / slows) ✓
+            //   Sidespin (omega.z ≠ 0):                  ±X kick (lateral deviation)   ✓
+            //
+            // Y component is zeroed — don't fight the physics-engine vertical bounce.
+            //
+            Vector3 omega    = _ballRb.angularVelocity;
+            Vector3 spinKick = -Vector3.Cross(omega, Vector3.down * BALL_RADIUS) * TABLE_FRICTION;
+            spinKick.y = 0f;
+            _ballRb.AddForce(spinKick, ForceMode.VelocityChange);
+
+            // Spin decays on contact — some angular energy is absorbed by friction.
+            _ballRb.angularVelocity = omega * SPIN_DECAY;
         }
 
-        else if (state == gameState.enemyPaddle)
+        // ── Floor contact: audio only — ball bounces naturally ────────────────
+        bool isFloor = nameLower == "floor" || nameLower.Contains("floor");
+        if (isFloor && _ballRb != null)
+            PlaySound(_floorBounceClip, _ballRb.linearVelocity.magnitude, "FLOOR_trig");
+
+        // ── Net: audio only — no fault/scoring ───────────────────────────────
+        bool isNet = _curCol == "Net" || nameLower.Contains("net");
+        if (isNet)
         {
-            followPlayer = 0;
-            Debug.Log("Hit something after hitting Enemy Paddle");
-            audioData.Play(0);
-            
-
-            if (currentCollision == "playerside")
-            {
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.winPoint;
-                }
-                else
-                {
-                    state = gameState.playerSide;
-                }
-
-                
-            }
-            else if (currentCollision == "enemyside")
-            {
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.enemySide;
-                }
-                else
-                {
-                    state = gameState.winPoint;
-                }
-            }
-            else if (currentCollision == "floor")
-            {
-                state = gameState.winPoint;
-            }
-            else if (currentCollision == "Paddle"  || gameplay.playerPaddleCollision == 1)
-            {
-
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.winPoint;
-                }
-                else
-                {
-                    state = gameState.losePoint;
-                }
-                
-                gameplay.playerPaddleCollision = 0;
-            }
-            else if (currentCollision == "EnemyPaddle")
-            {
-
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.enemyPaddle;
-                }
-                else
-                {
-                    state = gameState.enemyPaddle;
-                }
-            }
-            if (serving == 1)
-            {
-                serving = 0;
-            }
+            PlaySound(_netHitClip, 3f, "NET");
+            // Training mode: net contact plays a sound but does not end the rally
+            // or award any point.  The ball continues bouncing naturally.
+            return;
         }
-
-        else if (state == gameState.playerSide)
-        {
-
-            Debug.Log("Detected bounce on player side");
-
-            followPlayer =0;
-            audioData.Play(0);
-
-
-
-            if (currentCollision == "playerside")
-            {
-
-                state = gameState.losePoint;
-            }
-            else if (currentCollision == "enemyside")
-            {
-                state = gameState.enemySide;
-
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.enemySide;
-                }
-                else
-                {
-                    state = gameState.enemySide;
-                }
-
-            }
-            else if (currentCollision == "floor")
-            {
-                state = gameState.losePoint;
-            }
-            else if (currentCollision == "Paddle"  || gameplay.playerPaddleCollision == 1)
-            {
-                
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.playerPaddle;
-                }
-                else
-                {
-                    state = gameState.playerPaddle;
-                }
-
-                gameplay.playerPaddleCollision = 0;
-            }
-            else if (currentCollision == "EnemyPaddle")
-            {
-               
-
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.winPoint;
-                }
-                else
-                {
-                    state = gameState.enemyPaddle;
-                }
-
-            }
-        }
-
-        else if (state == gameState.enemySide)
-        {
-            followPlayer = 0;
-            audioData.Play(0);
-
-            Debug.Log("Detected bounce on enemy");
-            if (currentCollision == "playerside")
-            {
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.playerSide;
-                }
-                else
-                {
-                    // UNDEFINED
-                    state = gameState.playerSide;
-                }
-
-            }
-            else if (currentCollision == "enemyside")
-            {
-                state = gameState.winPoint;
-            }
-            else if (currentCollision == "floor")
-            {
-                state = gameState.winPoint;
-            }
-            else if (currentCollision == "Paddle"  || gameplay.playerPaddleCollision == 1)
-            {
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.losePoint;
-                }
-                else
-                {
-                    // UNDEFINED
-                    state = gameState.playerPaddle;
-                }
-                gameplay.playerPaddleCollision = 0;
-            }
-            else if (currentCollision == "EnemyPaddle")
-            {
-               
-                if (serving == 1 || serving == 2)
-                {
-                    state = gameState.enemyPaddle;
-                }
-                else
-                {
-                    state = gameState.enemyPaddle;
-                }
-
-            }
-            enemyFlag = true;
-        }
-
-        else if (state == gameState.losePoint)
-        {
-            serving = 2;
-
-            
-
-            Debug.Log("Lose point");
-            enemy_score += 1;
-            player_text.GetComponent<UnityEngine.UI.Text>().text = "* Enemy Score: " + enemy_score.ToString() + "\r\n Our Score: "+ our_score.ToString();
-            state = gameState.enemyStart;
-        }
-
-        else if (state == gameState.winPoint)
-        {
-
-            audio_cheer.Play(0);
-            serving = 1;
-            our_score += 1;
-            player_text.GetComponent<UnityEngine.UI.Text>().text = "Enemy Score: " + enemy_score.ToString() + "\r\n * Our Score: " + our_score.ToString();
-
-            Debug.Log("gain point");
-            state = gameState.playerStart;
-        }
-
-
-
     }
 
+    // ── Audio ─────────────────────────────────────────────────────────────────
+    void PlaySound(AudioClip clip, float ballSpeed, string surface = "")
+    {
+        if (_audio == null)  { Debug.LogWarning("[ballbounce] PlaySound: _audio is NULL"); return; }
+        if (clip == null)    { Debug.LogWarning("[ballbounce] PlaySound: clip is NULL");   return; }
+        if (Time.time - _lastBounceTime < 0.04f) return;
+        _lastBounceTime = Time.time;
 
+        float pitch  = Mathf.Clamp(0.85f + ballSpeed * 0.04f, 0.7f, 1.6f);
+        float volume = Mathf.Clamp(0.6f  + ballSpeed * 0.04f, 0.6f, 1.0f);
+
+        // PlayOneShot: fires a non-interruptible one-shot instance.
+        // Unlike Play(), it never cuts itself short if called rapidly.
+        _audio.pitch = pitch;
+        _audio.PlayOneShot(clip, volume);
+
+        Debug.Log($"[ballbounce] SOUND PLAYED surface={surface} spd={ballSpeed:F1} " +
+                  $"vol={volume:F2} pitch={pitch:F2} clip={clip.name}");
+    }
 
 }
