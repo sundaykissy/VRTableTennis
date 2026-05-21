@@ -68,6 +68,20 @@ public class gameplay : MonoBehaviour
     private float       _lastHitTime  = -1f;
     private int         _lastHitFrame = -1;   // physics frame of last hit (blocks same-step double-fire)
 
+    // ── Table / serve tracking ────────────────────────────────────────────────
+    private float _tableTopY = 0.76f;   // world-space Y of table surface (cached in Start)
+    private float _netZ      = 0f;      // world-space Z of net centre (cached in Start)
+    // Edge-detect: only fire PaddleTableContact on the entering edge (above → below).
+    private bool  _paddleWasAboveTable = true;
+    // Per-serve tracking — reset at each HIDDEN→HELD transition.
+    private float _serveGrabTime              = -1f;          // Time.time when ball first held
+    private float _minPaddleTableDistThisServe = float.MaxValue; // closest paddle got to table
+    // Ideal topspin paddle contact normal in world space:
+    //   Vector3(0, 0.707, 0.707) = 45° closed toward opponent (+Z is opponent side).
+    //   PaddleAngleErrorDeg = Vector3.Angle(contactNormal, IDEAL_SPIN_NORMAL).
+    private static readonly Vector3 IDEAL_SPIN_NORMAL =
+        new Vector3(0f, 0.707f, 0.707f);
+
     private const float HIT_COOLDOWN  = 0.08f;   // min time between hits (s)
     private const float HIT_RADIUS    = 0.04f;   // 4 cm — ball radius + reliable skin
     private const float HIT_BASE_SPD  = 2.0f;    // m/s minimum outgoing speed
@@ -306,6 +320,20 @@ public class gameplay : MonoBehaviour
             enemyPaddle.SetActive(false);
             Debug.Log("[gameplay] Enemy paddle deactivated.");
         }
+
+        // ── Cache table surface Y and net Z ──────────────────────────────────
+        GameObject ps = GameObject.Find("playerside");
+        GameObject es = GameObject.Find("enemyside");
+        if (ps != null)
+        {
+            Collider psCol = ps.GetComponent<Collider>();
+            if (psCol != null) { _tableTopY = psCol.bounds.max.y; }
+        }
+        if (ps != null && es != null)
+        {
+            _netZ = (ps.transform.position.z + es.transform.position.z) * 0.5f;
+        }
+        Debug.Log($"[gameplay] Table top Y={_tableTopY:F3} m  Net Z={_netZ:F3}");
     }
 
     // ── Lazy anchor resolution ────────────────────────────────────────────────
@@ -517,6 +545,39 @@ public class gameplay : MonoBehaviour
         {
             _prevBallPos = _ballRb.position;
             return;
+        }
+
+        // ── Paddle-to-table proximity and contact tracking ────────────────────
+        // Recompute table top Y if it's still at default (handles late scene load).
+        if (_tableTopY < 0.1f || _tableTopY > 2.5f)
+        {
+            GameObject psGo = GameObject.Find("playerside");
+            if (psGo != null) { Collider c = psGo.GetComponent<Collider>();
+                if (c != null) _tableTopY = c.bounds.max.y; }
+        }
+
+        if (paddle != null && paddleBox != null && ExperimentLogger.SessionActive)
+        {
+            // Approximate paddle bottom: Rigidbody centre − half collider height
+            // (in world space, accounting for scale and rotation's Y contribution).
+            float paddleHalfH   = paddleBox.size.y * 0.5f
+                                * Mathf.Abs(paddle.transform.lossyScale.y);
+            float paddleBottomY = _paddleRb.position.y - paddleHalfH;
+            float distToTable   = paddleBottomY - _tableTopY;   // + = above, - = below
+
+            // ── Track minimum paddle-to-table distance this serve attempt ─────
+            if (distToTable < _minPaddleTableDistThisServe)
+                _minPaddleTableDistThisServe = distToTable;
+
+            // ── PaddleTableContact: edge-detect — only on entering edge ───────
+            bool nowBelow = distToTable < 0f;
+            if (nowBelow && _paddleWasAboveTable)
+            {
+                float penetration = -distToTable;
+                ExperimentLogger.Instance?.LogPaddleTableContact(penetration);
+                Debug.Log($"[gameplay] PaddleTableContact penetration={penetration:F4} m");
+            }
+            _paddleWasAboveTable = !nowBelow;
         }
 
         // ── Belt-and-suspenders: re-enforce CCD settings every frame ─────────────
@@ -907,11 +968,27 @@ public class gameplay : MonoBehaviour
 
         PlayPaddleHitSound(spd);
 
-        ExperimentLogger.Instance?.LogPlayerHit(spd, tangential.magnitude, 0, 0);
+        // PaddleTiltDeg: raw angle from vertical (0°=flat, 90°=vertical spin stance).
+        float paddleTiltDeg = Vector3.Angle(contactNormal, Vector3.up);
 
-        Debug.Log($"[gameplay] HIT spd={spd:F1} normalIn={normalIn:F1} " +
-                  $"padVel={_paddleVelocity.magnitude:F1} brush={tangential.magnitude:F1} " +
-                  $"spin={_ballRb.angularVelocity.magnitude:F0}");
+        // PaddleAngleErrorDeg: deviation from ideal topspin normal.
+        // IDEAL_SPIN_NORMAL = Vector3(0, 0.707, 0.707) — 45° closed toward opponent.
+        // 0° = perfect topspin orientation. 90° = flat hit. 180° = opposite face.
+        float paddleAngleErrorDeg = Vector3.Angle(contactNormal, IDEAL_SPIN_NORMAL);
+
+        // MinPaddleTableDistM: closest the paddle came to the table this serve.
+        // Cap at 9.999 if never within measurable range (player never approached table).
+        float minDist = _minPaddleTableDistThisServe < 9f
+                      ? _minPaddleTableDistThisServe : 9.999f;
+
+        ExperimentLogger.Instance?.LogPlayerHit(
+            spd, tangential.magnitude,
+            paddleAngleErrorDeg, paddleTiltDeg,
+            minDist);
+
+        Debug.Log($"[gameplay] HIT spd={spd:F1} spin={_ballRb.angularVelocity.magnitude:F0} " +
+                  $"tilt={paddleTiltDeg:F1}° angleErr={paddleAngleErrorDeg:F1}° " +
+                  $"minTableDist={minDist:F3}m");
     }
 
     // Sharp percussive click matching real table tennis paddle contact.
@@ -1114,6 +1191,9 @@ public class gameplay : MonoBehaviour
             _leftAnchorPrev   = _leftPos;
             _leftHandVelocity = Vector3.zero;
             _servePhase       = ServePhase.Held;
+            // Reset per-serve metrics — new serve attempt begins now.
+            _serveGrabTime               = Time.time;
+            _minPaddleTableDistThisServe = float.MaxValue;
 
             // Diagnostic: log every collider overlapping the grab point so we
             // can confirm what geometry the ball was fighting during hold.
@@ -1173,7 +1253,17 @@ public class gameplay : MonoBehaviour
                 playerPaddleCollision = 0;
                 _serveResetArmed      = false;  // must release trigger before serve-reset can fire
                 _ballSeparated        = true;   // ball just left hand — reset contact lockout
-                Debug.Log($"[SERVE] Tossed vel={tossVel:F2}  ball.y={_ballRb.position.y:F2}");
+
+                // Log serve event: distance to net and prep time.
+                // serveDistToNet: |ballZ - netZ|. Smaller = closer to net (illegally forward).
+                // prepTime: seconds from ball appearing in hand to this toss.
+                float serveDistToNet = Mathf.Abs(ballInHand.z - _netZ);
+                float prepTime       = _serveGrabTime >= 0f
+                                     ? Time.time - _serveGrabTime : 0f;
+                ExperimentLogger.Instance?.LogServe(serveDistToNet, prepTime);
+
+                Debug.Log($"[SERVE] Tossed vel={tossVel:F2}  ball.y={_ballRb.position.y:F2} " +
+                          $"distToNet={serveDistToNet:F3} prep={prepTime:F2}s");
             }
         }
 
@@ -1193,6 +1283,9 @@ public class gameplay : MonoBehaviour
             _leftAnchorPrev   = _leftPos;
             _leftHandVelocity = Vector3.zero;
             _servePhase       = ServePhase.Held;
+            // Reset per-serve metrics on re-grab too.
+            _serveGrabTime               = Time.time;
+            _minPaddleTableDistThisServe = float.MaxValue;
             Debug.Log($"[SERVE] Re-grabbed — ball.y={_ballRb.position.y:F2}");
         }
     }
@@ -1265,9 +1358,7 @@ public class gameplay : MonoBehaviour
                 _aiLastHitTime       = Time.time;
                 _lastHitTime         = Time.time;  // keep juggle-lockout window alive during AI rally
 
-                ExperimentLogger.Instance?.LogAIHit(
-                    _ballRb.linearVelocity.magnitude,
-                    _ballRb.angularVelocity.magnitude, 0, 0);
+                // AI disabled in training mode — logging removed.
 
                 Debug.Log($"[AI] Return vel={_ballRb.linearVelocity:F1}");
             }
