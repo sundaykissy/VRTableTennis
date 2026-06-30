@@ -24,6 +24,37 @@ public class gameplay : MonoBehaviour
     public static Quaternion sharedLeftRot   = Quaternion.identity;
     public static bool       sharedLeftValid = false;
 
+    // ── Haptic event — paddle-ball hit ────────────────────────────────────────
+    // Fires once per validated paddle hit, after all hit guards pass.
+    // Args: effectiveSpd (m/s), spinMagnitude (rad/s).
+    // Consumed by WoojerHapticManager and ControllerHapticManager (Group 3 only).
+    // Safe to leave unsubscribed.
+    public static event System.Action<float, float> OnValidPaddleHit;
+
+    // ── Haptic event — paddle-table contact ───────────────────────────────────
+    // Fires once on the entering edge when the paddle bottom crosses below _tableTopY.
+    // Arg: penetration depth (metres, positive).
+    // Consumed by WoojerHapticManager and ControllerHapticManager (Group 3 only).
+    // Safe to leave unsubscribed.
+    public static event System.Action<float> OnPaddleTableContact;
+
+    // ── Per-hit telemetry event for variance audit ────────────────────────────
+    // Fired from ApplyPaddleHit immediately after angular velocity is set.
+    // Subscribed by RealHitVarianceLogger; safe to leave unsubscribed.
+    public struct HitTelemetryData
+    {
+        public string  hitSource;             // "Layer_ComputePen" or "Layer4_Physics"
+        public Vector3 contactPoint;          // world-space contact point
+        public Vector3 contactNormal;         // authoritative outward normal
+        public float   leverArmMag;           // |contactPt - paddleBoxCenter| (m)
+        public Vector3 paddleLinearVelocity;  // EMA-smoothed (or injected) linear vel
+        public Vector3 paddleAngVelocity;     // EMA-smoothed (or injected) angular vel
+        public float   effectiveSpd;          // |paddleVel + w x leverArm| (m/s)
+        public float   outSpeed;              // assigned ball speed (m/s)
+        public float   outSpin;              // |_ballRb.angularVelocity| after hit (rad/s)
+    }
+    public static event System.Action<HitTelemetryData> OnHitTelemetry;
+
     // ── Inspector ─────────────────────────────────────────────────────────────
     public GameObject paddle;
     public GameObject ball;
@@ -41,6 +72,26 @@ public class gameplay : MonoBehaviour
     [Tooltip("Y=180 flips blade face toward opponent")]
     public Vector3 paddleRotationOffset = new Vector3(0f, 180f, 0f);
 
+    [Header("Velocity Pipeline")]
+    [Tooltip("EMA smoothing factor for LINEAR paddle velocity (0–1). " +
+             "Higher = faster response, more jitter. Lower = smoother, more lag. " +
+             "Default 0.35. At 120 Hz, 0.35 ≈ 22 ms time constant.")]
+    public float velEmaAlpha = 0.35f;
+    [Tooltip("EMA smoothing factor for ANGULAR paddle velocity (0–1). " +
+             "Higher = faster wrist-snap response. Lower = more jitter rejection. " +
+             "Default 0.25. At 120 Hz, 0.25 ≈ 30 ms time constant.")]
+    public float angEmaAlpha = 0.25f;
+
+    [Header("Low-Speed Juggling Stabilization")]
+    [Tooltip("Linear paddle speed (m/s) below which stabilization activates. Above this value all three assists are fully off.")]
+    public float lowSpeedAssistThreshold = 2.5f;
+    [Tooltip("How much angular-velocity contribution is reduced at zero speed. 0=no reduction, 1=full removal. Ramps smoothly to zero effect at threshold.")]
+    public float lowSpeedAngularDamping  = 0.85f;
+    [Tooltip("How much spin generation is reduced at zero speed. 0=no reduction, 1=full removal. Ramps smoothly to zero effect at threshold.")]
+    public float lowSpeedSpinDamping     = 0.6f;
+    [Tooltip("Fraction (0–1) by which the spin-decomp normal is blended toward the true paddle face at zero speed. Removes mm-level contact-point jitter. Does NOT alter shot direction.")]
+    public float juggleStabilityStrength = 0.3f;
+
     // ── Device lists ──────────────────────────────────────────────────────────
     private List<XRInputDevice> _rightDevices = new List<XRInputDevice>();
     private List<XRInputDevice> _leftDevices  = new List<XRInputDevice>();
@@ -54,8 +105,9 @@ public class gameplay : MonoBehaviour
     private bool _leftValid  = false;
 
     // ── Paddle velocity tracking ──────────────────────────────────────────────
-    private Vector3 _prevWorldPos   = Vector3.zero;
-    private Vector3 _paddleVelocity = Vector3.zero;
+    private Vector3 _prevWorldPos        = Vector3.zero;
+    private Vector3 _paddleVelocity      = Vector3.zero;
+    private Vector3 _paddleAngularVelocity = Vector3.zero; // world-space rad/s — wrist rotation
     private Vector3   _prevBallPos      = Vector3.zero;   // swept tunneling check
     private bool      _prevBallPosValid = false;          // guards SphereCast before first valid frame
     private Vector3    _prevPaddlePos      = Vector3.zero;   // paddle-sweep check
@@ -67,10 +119,71 @@ public class gameplay : MonoBehaviour
     private Collider  _ballCollider     = null;           // physics collision forwarder
     private float       _lastHitTime  = -1f;
     private int         _lastHitFrame = -1;   // physics frame of last hit (blocks same-step double-fire)
+    // ── Hit diagnostics ───────────────────────────────────────────────────────
+    private string  _diagLayer           = "none"; // set by each layer before calling ApplyPaddleHit
+    private float   _diagSweepDist       = 0f;     // sweep length this step (ball or paddle)
+    private float   _diagPrevBallFaceSign = 0f;    // sign(dot(ball-paddleFace,faceNormal)) prev frame — pass-through detection
+    // ── Velocity EMA smoothing ────────────────────────────────────────────────
+    // Applied after the per-step raw computation in FixedUpdate.
+    // Alphas are now inspector-tunable (velEmaAlpha / angEmaAlpha).
+    // Angular spike suppression ratio: if a single-step angular velocity is
+    // more than ANG_SPIKE_RATIO times the previous smoothed magnitude, it is
+    // treated as a tracking glitch and clamped to the smoothed value.
+    // Catches medium spikes (5–15 rad/s) that slip under the ANG_VEL_MAX hard cap.
+    private const float ANG_SPIKE_RATIO = 3.5f;
+    private Vector3     _smoothPaddleVel    = Vector3.zero;
+    private Vector3     _smoothPaddleAngVel = Vector3.zero;
+
+    // ── OVR velocity cache (filled in Update, read in FixedUpdate) ────────────
+    // OVRInput.Update() runs once per render frame inside Update().
+    // Reading OVRInput in FixedUpdate risks returning a stale value when two
+    // physics steps fire within the same render frame (120 Hz physics / 72 Hz display).
+    // Cache here (world-space) so FixedUpdate always gets this frame's reading.
+    private Vector3 _cachedOVRVel   = Vector3.zero;
+    private int     _cachedOVRFrame = -1;
+
+    // ── Pre-allocated physics / scratch buffers ───────────────────────────────
+    // Eliminates per-step GC allocations from FixedUpdate hot paths.
+    // _cornersCache : replaces `new Vector3[8]` in ANGULAR_SWEEP diagnostic
+    // _overlapBuffer: used with OverlapBoxNonAlloc in PADDLE-FREEZE diagnostic
+    private readonly Vector3[]  _cornersCache  = new Vector3[8];
+    private readonly Collider[] _overlapBuffer = new Collider[16];
+
+    // ── Paddle-freeze diagnostics ─────────────────────────────────────────────
+    private float      _diagPrevLinVelMag     = 0f;
+    private float      _diagPrevAngVelMag     = 0f;
+    private Vector3    _diagExpectedPaddlePos = Vector3.zero;
+    private Quaternion _diagExpectedPaddleRot = Quaternion.identity;
+    private float      _diagFixedUpdateStart  = 0f;
+    private float      _diagHitDetStart       = 0f;
+    private float      _diagApplyHitStart     = 0f;
+    // ── Angular-sweep diagnostics ─────────────────────────────────────────────
+    // Per-step state: 0=locked(cooldown/sep), 1=open_no_hit, 2=fired
+    private int        _diagL0State               = 0;
+    private int        _diagL1State               = 0;
+    private int        _diagL2State               = 0;
+    private int        _diagL3State               = 0;
+    private int        _diagL4State               = 0;
+    private bool       _diagApplyHitCalledThisStep  = false;
+    // Set true when a geometry finder found a contact point but the unified swing
+    // guard rejected it (surfVel < SWING_MIN).  Distinguishes SWING_GUARD_REJECTED
+    // from OPEN_BUT_GEOMETRY_MISS in ANGULAR-SWEEP arbitration reports.
+    private bool       _diagSwingGuardRejected     = false;
+    // Previous-frame values for delta / crossing calculations
+    private Quaternion _diagPrevPaddleRotAS    = Quaternion.identity;
+    private Vector3    _diagPrevPaddleFwdAS    = Vector3.forward;
+    private float      _diagPrevFaceDotAS      = 0f;
+    // Last hit's normal/velocity — written in ApplyPaddleHit, read in ANGULAR_SWEEP
+    private Vector3    _diagLastRawNormal      = Vector3.zero;
+    private Vector3    _diagLastSnappedNormal  = Vector3.zero;
+    private bool       _diagLastNormalFlipped  = false;
+    private Vector3    _diagLastAssignedVel    = Vector3.zero;
+    private Vector3    _diagLastFinalBallVel   = Vector3.zero;
 
     // ── Table / serve tracking ────────────────────────────────────────────────
-    private float _tableTopY = 0.76f;   // world-space Y of table surface (cached in Start)
-    private float _netZ      = 0f;      // world-space Z of net centre (cached in Start)
+    private float   _tableTopY    = 0.76f;      // world-space Y of table surface (cached in Start)
+    private float   _netZ         = 0f;         // world-space Z of net centre (cached in Start)
+    private Vector3 _tableForward = Vector3.forward; // horizontal unit vector playerside→enemyside (cached in Start)
     // Edge-detect: only fire PaddleTableContact on the entering edge (above → below).
     private bool  _paddleWasAboveTable = true;
     // Per-serve tracking — reset at each HIDDEN→HELD transition.
@@ -87,8 +200,22 @@ public class gameplay : MonoBehaviour
     private const float HIT_BASE_SPD  = 2.0f;    // m/s minimum outgoing speed
     private const float HIT_PAD_SCALE = 0.45f;   // paddle-velocity scale (reduced: was 0.65, triple-hit compounding)
     private const float HIT_MAX_SPD   = 12.0f;   // hard cap (m/s)
-    private const float SPIN_COEFF    = 60f;     // rad/s per m/s of tangential brush velocity
+    // SPIN_COEFF raised 60→75 (calibration pass): tangential brush velocity converts
+    // more directly to spin, making topspin/backspin clearly distinguishable.
+    private const float SPIN_COEFF    = 75f;     // rad/s per m/s of tangential brush velocity
     private const float MAX_SPIN      = 300f;    // rad/s cap — prevents physics instability over long sessions
+    // ── Unified swing guard ───────────────────────────────────────────────────
+    // Single minimum paddle surface speed applied identically across ALL layers
+    // and Layer 4 physics callback.  Previously each layer defined its own local
+    // constant (L0_MIN_SWING_SPD, MIN_SWING_SPD, L4_MIN_SWING_SPD), all = 0.5f,
+    // but isolated — a change in one never propagated to others.
+    private const float SWING_MIN     = 0.5f;    // m/s — unified across all contact layers
+    // ── Tracking dropout spike cap ────────────────────────────────────────────
+    // Quest 3 tracking occasionally drops and snaps, producing single-frame
+    // rotation deltas that compute as 20–30+ rad/s.  Real wrist snaps peak well
+    // below 40 rad/s (~2300°/s).  Hard cap kills ghost surface speeds from dropout
+    // corrections while leaving genuine fast wrist flicks entirely unaffected.
+    private const float ANG_VEL_MAX   = 40f;    // rad/s — hard cap on angular velocity
 
     private bool _trackingReady = false;
     private bool _tableScaled   = false;
@@ -131,6 +258,8 @@ public class gameplay : MonoBehaviour
     // trigger presses during a rally from instantly vanishing the ball.
     private float _serveResetHoldStart = -1f;
     private const float SERVE_RESET_HOLD_SEC = 0.4f;
+    private float _serveDiagLastLog = -1f;  // throttle for trigger-held diagnostic
+    private float _hitDiagLastLog   = -1f;  // throttle for hit-window diagnostic
 
     // Contact-session lockout — prevents the same paddle contact from firing
     // multiple hit layers (OverlapBox, proximity, SphereCast, BoxCast, physics).
@@ -149,21 +278,49 @@ public class gameplay : MonoBehaviour
     private ServePhase _servePhase = ServePhase.Hidden;
     private float      _dropTime   = -10f;
 
+    // testModeActive is always false in production — kept as a static field because
+    // RealHitVarianceLogger reads it to skip telemetry events during non-juggling frames.
+    [HideInInspector] public static bool testModeActive = false;
+
+    /// <summary>
+    /// Set true by RealHitVarianceLogger to instrument real juggling hits
+    /// outside the serve/rally state machine.  Bypasses SessionActive and
+    /// _hitWindowOpen gates in FixedUpdate and Layer 4 so that every
+    /// validated paddle contact is forwarded to OnHitTelemetry.
+    /// Cleared automatically when RealHitVarianceLogger finishes collecting.
+    /// </summary>
+    [HideInInspector] public static bool jugglingMode = false;
+
     // ── Audio ─────────────────────────────────────────────────────────────────
+    // AUDIO-ONLY PATCH: this is the only subsystem changed from the old working-physics file.
+    // Paddle-hit sound is played through a dedicated 2D source on the gameplay GameObject.
+    // The old paddle-mounted AudioSource is retained only so existing components are not disturbed.
+    private AudioSource _gameplayAudio;
     private AudioSource _paddleAudio;
     private AudioClip   _paddleHitClip;
+
+    // ── Per-rally bounce counter ───────────────────────────────────────────────
+    // Counts table contacts (playerside / enemyside) since the last paddle hit.
+    // Subscribed to ballbounce.OnTableBounce; reset at the start of each hit.
+    // Exposed in [PHYSICS-AUDIT] diagnostic so researchers can correlate energy
+    // loss with rally length (longer rally → more decay → weaker returns).
+    private int _bounceCount = 0;
 
     // ── Events ────────────────────────────────────────────────────────────────
     void OnEnable()
     {
         InputDevices.deviceConnected    += OnDeviceChange;
         InputDevices.deviceDisconnected += OnDeviceChange;
+        ballbounce.OnTableBounce        += OnTableBounceReceived;
     }
     void OnDisable()
     {
         InputDevices.deviceConnected    -= OnDeviceChange;
         InputDevices.deviceDisconnected -= OnDeviceChange;
+        ballbounce.OnTableBounce        -= OnTableBounceReceived;
     }
+
+    void OnTableBounceReceived(string colName, Vector3 pos) => _bounceCount++;
     void OnDeviceChange(XRInputDevice d) => RefreshDeviceLists();
 
     void RefreshDeviceLists()
@@ -223,6 +380,7 @@ public class gameplay : MonoBehaviour
                 padMat.bounceCombine   = PhysicsMaterialCombine.Minimum;
                 padMat.frictionCombine = PhysicsMaterialCombine.Average;
                 paddleBox.material     = padMat;
+                paddleBox.sharedMaterial = padMat;
             }
             _paddleRenderers = paddle.GetComponentsInChildren<Renderer>(true);
             // Always visible — underground (y=-100) until OVRInput gives real tracking.
@@ -237,13 +395,44 @@ public class gameplay : MonoBehaviour
             if (fwd == null) fwd = paddle.AddComponent<PaddleHitForwarder>();
             fwd.owner = this;
 
+            // AUDIO-ONLY PATCH: keep all old hit detection/physics unchanged.
+            // Do NOT play paddle-hit audio from the moving paddle's 3D AudioSource.
+            // Use a dedicated 2D AudioSource on this gameplay GameObject instead.
             _paddleHitClip = CreatePaddleClickClip();
-            _paddleAudio   = paddle.GetComponent<AudioSource>();
-            if (_paddleAudio == null) _paddleAudio = paddle.AddComponent<AudioSource>();
-            _paddleAudio.clip         = _paddleHitClip;
-            _paddleAudio.spatialBlend = 1f;
-            _paddleAudio.volume       = 0.9f;
-            _paddleAudio.playOnAwake  = false;
+
+            _gameplayAudio = gameObject.GetComponent<AudioSource>();
+            if (_gameplayAudio == null)
+                _gameplayAudio = gameObject.AddComponent<AudioSource>();
+
+            _gameplayAudio.clip                  = null;
+            _gameplayAudio.spatialBlend          = 0f;   // 2D: avoids Quest/OpenXR near-field 3D rolloff
+            _gameplayAudio.volume                = 1f;
+            _gameplayAudio.mute                  = false;
+            _gameplayAudio.enabled               = true;
+            _gameplayAudio.playOnAwake           = false;
+            _gameplayAudio.loop                  = false;
+            _gameplayAudio.priority              = 0;
+            _gameplayAudio.outputAudioMixerGroup = null;
+            _gameplayAudio.bypassEffects         = true;
+            _gameplayAudio.bypassReverbZones     = true;
+            _gameplayAudio.bypassListenerEffects = true;
+
+            // Retain the old paddle AudioSource reference but do not use it for hit sound.
+            _paddleAudio = paddle.GetComponent<AudioSource>();
+
+            var listener = FindObjectOfType<AudioListener>();
+            if (listener == null)
+                Debug.LogError("[SOUND-DIAG][ERROR] No AudioListener found in scene");
+            else
+                Debug.Log($"[SOUND-DIAG] AudioListener found on '{listener.gameObject.name}'");
+
+            if (Mathf.Approximately(AudioListener.volume, 0f))
+            {
+                AudioListener.volume = 1f;
+                Debug.Log("[SOUND-DIAG] AudioListener.volume was 0 — reset to 1");
+            }
+
+            Debug.Log($"[SOUND-DIAG] Dedicated gameplay audio initialized audioNull={_gameplayAudio == null} clipNull={_paddleHitClip == null}");
         }
 
         // Auto-find ball
@@ -261,6 +450,41 @@ public class gameplay : MonoBehaviour
         {
             _ballRb       = ball.GetComponent<Rigidbody>();
             _ballCollider = ball.GetComponent<Collider>();
+
+            // The ball is held in the left hand, which sits inside the OVRPlayerController
+            // capsule at release.  When isKinematic flips false the physics solver fires a
+            // 0.27 m depenetration impulse sideways — observed as "ball flies sideways on toss".
+            // Fix: permanently ignore all collisions between the ball and every collider on
+            // the OVRPlayerController hierarchy.  The player body capsule should never affect
+            // ball physics — this is safe for the entire session.
+            if (_ballCollider != null)
+            {
+                GameObject ovrPC = GameObject.Find("OVRPlayerController");
+                if (ovrPC != null)
+                {
+                    Collider[] playerCols = ovrPC.GetComponentsInChildren<Collider>(true);
+                    foreach (Collider pc in playerCols)
+                    {
+                        Physics.IgnoreCollision(_ballCollider, pc, true);
+                        Debug.Log($"[gameplay] IgnoreCollision: ball ↔ '{pc.gameObject.name}/{pc.GetType().Name}'");
+                    }
+                    // CharacterController extends Collider but Unity 6 does not always
+                    // include it in GetComponentsInChildren<Collider>() results — ignore
+                    // it explicitly so the capsule body never kicks the ball sideways.
+                    CharacterController cc = ovrPC.GetComponentInChildren<CharacterController>(true);
+                    if (cc != null)
+                    {
+                        Physics.IgnoreCollision(_ballCollider, cc, true);
+                        Debug.Log($"[gameplay] IgnoreCollision: ball ↔ CharacterController on '{cc.gameObject.name}' (explicit)");
+                    }
+                    Debug.Log($"[gameplay] Ball↔OVRPlayerController: ignored {playerCols.Length} collider(s) + CC — depenetration fix applied");
+                }
+                else
+                {
+                    Debug.LogWarning("[gameplay] OVRPlayerController not found — ball may still be kicked sideways on toss");
+                }
+            }
+
             if (_ballRb != null)
             {
                 _ballRb.mass                   = 0.0027f;    // real TT ball: 2.7 g
@@ -332,8 +556,46 @@ public class gameplay : MonoBehaviour
         if (ps != null && es != null)
         {
             _netZ = (ps.transform.position.z + es.transform.position.z) * 0.5f;
+            Vector3 esPs = es.transform.position - ps.transform.position;
+            esPs.y = 0f;   // flatten to horizontal plane
+            if (esPs.sqrMagnitude > 0.01f) _tableForward = esPs.normalized;
         }
-        Debug.Log($"[gameplay] Table top Y={_tableTopY:F3} m  Net Z={_netZ:F3}");
+        Debug.Log($"[gameplay] Table top Y={_tableTopY:F3} m  Net Z={_netZ:F3}  tableForward={_tableForward:F3}");
+        // ── Auto-create RealHitVarianceLogger if not already in scene ─────────
+        if (FindObjectOfType<RealHitVarianceLogger>() == null)
+        {
+            gameObject.AddComponent<RealHitVarianceLogger>();
+            Debug.Log("[gameplay] RealHitVarianceLogger auto-attached.");
+        }
+    }
+
+    // ── Called by TableAutoPlace after every recenter ─────────────────────────
+    // Refreshes all cached table-position values so paddle-table contact
+    // detection and serve validation use the table's new world position.
+    public void RefreshTableCacheAfterRecenter()
+    {
+        GameObject ps = GameObject.Find("playerside");
+        GameObject es = GameObject.Find("enemyside");
+
+        if (ps != null)
+        {
+            Collider psCol = ps.GetComponent<Collider>();
+            if (psCol != null)
+                _tableTopY = psCol.bounds.max.y;
+        }
+
+        if (ps != null && es != null)
+        {
+            _netZ = (ps.transform.position.z + es.transform.position.z) * 0.5f;
+            Vector3 esPs = es.transform.position - ps.transform.position;
+            esPs.y = 0f;
+            if (esPs.sqrMagnitude > 0.01f) _tableForward = esPs.normalized;
+        }
+
+        // Reset edge-detect so the very next paddle-table contact fires cleanly.
+        _paddleWasAboveTable = true;
+
+        Debug.Log($"[TABLE-CACHE] refreshed after recenter tableTopY={_tableTopY:F4} netZ={_netZ:F4}  tableForward={_tableForward:F3}");
     }
 
     // ── Lazy anchor resolution ────────────────────────────────────────────────
@@ -394,6 +656,33 @@ public class gameplay : MonoBehaviour
 
         UpdateControllerPoses();
 
+        // ── Cache OVR controller velocity — world space ───────────────────────
+        // OVRInput.Update() was called two lines above: state is guaranteed fresh.
+        // OVRInput must NOT be polled in FixedUpdate for velocity — it would return
+        // the same stale reading on any second physics step within the same frame.
+        // GetLocalControllerVelocity returns velocity in the OVRCameraRig's
+        // TrackingSpace local frame.  Multiply by the TrackingSpace world rotation
+        // to get a world-space vector that matches the world-space position delta.
+        {
+            Vector3 rawOVRVel = Vector3.zero;
+            try { rawOVRVel = OVRInput.GetLocalControllerVelocity(OVRInput.Controller.RTouch); } catch { }
+            if (rawOVRVel.sqrMagnitude > 0.0001f && _rightAnchor != null)
+            {
+                // _rightAnchor (rightControllerAnchor) is a direct child of TrackingSpace.
+                // _rightAnchor.parent.rotation is therefore the TrackingSpace world rotation —
+                // the correct local-to-world mapping for OVR velocities.
+                Quaternion tsRot = _rightAnchor.parent != null
+                                 ? _rightAnchor.parent.rotation
+                                 : Quaternion.identity;
+                _cachedOVRVel = tsRot * rawOVRVel;
+            }
+            else
+            {
+                _cachedOVRVel = Vector3.zero;
+            }
+            _cachedOVRFrame = Time.frameCount;
+        }
+
         if (ballbounce.enemyFlag) FollowBall();
         if (ballbounce.resetFlag) ResetEnemyPaddle();
 
@@ -414,19 +703,20 @@ public class gameplay : MonoBehaviour
         // Writing to transform here (outside FixedUpdate) bypasses the CCD sweep
         // and desynchronises the collider from the Rigidbody, causing tunneling.
 
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
         if (++_debugFrame % 90 == 0)
         {
             Debug.Log($"[gameplay] rightValid={_rightValid} rightPos={_rightPos:F2} " +
                       $"leftValid={_leftValid} leftPos={_leftPos:F2} " +
                       $"state={ballbounce.state} phase={_servePhase} session={ExperimentLogger.SessionActive}");
 
-            // Per-request: paddle tracking diagnostic (every ~1.5 s at 60 fps)
             if (paddle != null)
                 Debug.Log($"[RIGHT PADDLE] tracking={_trackingReady} " +
                           $"rightValid={_rightValid} " +
                           $"pos={paddle.transform.position.ToString("F2")} " +
                           $"anchor={(_rightAnchor != null ? _rightAnchor.name : "none")}");
         }
+#endif
 
         // ── Ball visibility safety ────────────────────────────────────────
         // Ball is always rendered — it is never moved underground any more.
@@ -494,11 +784,76 @@ public class gameplay : MonoBehaviour
     void FixedUpdate()
     {
         if (paddle == null || _paddleRb == null) return;
+        _diagFixedUpdateStart = Time.realtimeSinceStartup;
+
+        // ── Render-frame stall detection ──────────────────────────────────────
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+        if (Time.deltaTime > 0.1f)
+            Debug.Log($"[FREEZE-DIAG] FRAME_STALL  deltaTime={Time.deltaTime * 1000f:F1} ms" +
+                      $"  frame={Time.frameCount}  fixedTime={Time.fixedTime:F3}");
+#endif
+
+        // ── Ball Rigidbody sleep guard ────────────────────────────────────────
+        // WakeUp() must run in ALL builds — a sleeping ball ignores collision
+        // callbacks regardless of build type.  Only the log is dev-only.
+        if (_ballRb != null && _ballRb.IsSleeping())
+        {
+            _ballRb.WakeUp();
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            Debug.Log($"[FREEZE-DIAG] Ball was SLEEPING — woke up.  frame={Time.frameCount}");
+#endif
+        }
+
+        // ── Freshen right-hand pose directly in FixedUpdate ───────────────────
+        // UpdateControllerPoses() runs in Update() — FixedUpdate can fire 1-2×
+        // per render frame, always BEFORE Update() in the same frame.  This means
+        // the cached _rightPos/_rightRot are from the PREVIOUS render frame (~11 ms
+        // stale at 90 Hz).  On a 50 ms wrist flick that lag is ~13° of paddle-face
+        // error.  Re-querying InputTracking here gives a sub-frame pose that is
+        // current for this physics step.  OVR is NOT re-queried — OVRInput caches
+        // after OVRInput.Update() which won't have run yet; InputTracking/XRDevice
+        // queries go directly to the XR subsystem and DO return the latest data.
+        {
+            Vector3    rp2 = InputTracking.GetLocalPosition(XRNode.RightHand);
+            Quaternion rr2 = InputTracking.GetLocalRotation(XRNode.RightHand);
+            if (rp2.sqrMagnitude > 0.0001f || rr2 != Quaternion.identity)
+            { _rightPos = rp2; _rightRot = rr2; _rightValid = true; }
+            else if (_rightDevices.Count > 0)
+            {
+                foreach (var d in _rightDevices)
+                {
+                    Vector3 rp3; Quaternion rr3;
+                    if (d.TryGetFeatureValue(XRCommonUsages.devicePosition, out rp3) &&
+                        d.TryGetFeatureValue(XRCommonUsages.deviceRotation, out rr3) &&
+                        rp3 != Vector3.zero)
+                    { _rightPos = rp3; _rightRot = rr3; _rightValid = true; break; }
+                }
+            }
+        }
 
         if (_rightValid)
         {
             Vector3    fp = _rightPos + _rightRot * paddlePositionOffset;
             Quaternion fr = _rightRot  * Quaternion.Euler(paddleRotationOffset);
+
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            if (Time.frameCount % 120 == 0 && paddle != null)
+            {
+                string pbPos       = paddleBox != null ? paddleBox.transform.position.ToString("F4") : "null";
+                string pbTpCenter  = paddleBox != null ? paddleBox.transform.TransformPoint(paddleBox.center).ToString("F4") : "null";
+                string ovrRigPos   = _ovrRig   != null ? _ovrRig.transform.position.ToString("F4") : "null";
+                string rAnchorPos  = _rightAnchor != null ? _rightAnchor.position.ToString("F4") : "null";
+                Debug.Log($"[XFORM-AUDIT] frame={Time.frameCount}" +
+                          $"\n  _rightValid={_rightValid}" +
+                          $"\n  _rightPos={_rightPos:F4}  _rightRot={_rightRot.eulerAngles:F2}" +
+                          $"\n  fp={fp:F4}  fr={fr.eulerAngles:F2}" +
+                          $"\n  _paddleRb.pos={_paddleRb.position:F4}  _paddleRb.rot={_paddleRb.rotation.eulerAngles:F2}" +
+                          $"\n  paddle.tr.pos={paddle.transform.position:F4}" +
+                          $"\n  paddleBox.tr.pos={pbPos}  TrPt(c)={pbTpCenter}" +
+                          $"\n  OVRCameraRig={ovrRigPos}  rightAnchor={rAnchorPos}" +
+                          $"\n  posOffset={paddlePositionOffset:F4}  rotOffset={paddleRotationOffset:F2}");
+            }
+#endif
 
             // MovePosition/MoveRotation on a kinematic Rigidbody: the physics
             // engine sweeps the collider from old→new position every step.
@@ -510,25 +865,215 @@ public class gameplay : MonoBehaviour
             _paddleRb.MovePosition(fp);
             _paddleRb.MoveRotation(fr);
 
-            // Paddle velocity — OVR hardware velocity preferred; position delta fallback.
-            Vector3 ovrVel = Vector3.zero;
-            try { ovrVel = OVRInput.GetLocalControllerVelocity(OVRInput.Controller.RTouch); } catch { }
-
-            // Guard against tracking-dropout velocity spikes.
-            // If tracking was lost last step (_prevRightValid=false) or if the
-            // position delta is larger than a realistic maximum swing (0.2 m per
-            // step = 24 m/s at 120 Hz), _prevWorldPos is stale.  Using the raw
-            // delta would produce an inflated velocity and fire a ghost paddle hit.
-            // In that case prefer OVR velocity (measured by the hardware IMU) or
-            // zero; never the stale positional delta.
+            // ── Linear velocity — per-physics-step position delta (primary) ─────
+            // Primary: fp − _prevWorldPos divided by fixedDeltaTime.
+            // _prevWorldPos is updated every FixedUpdate, so this delta reflects the
+            // true per-step displacement — it is never stale.
+            //
+            // Fallback (tracking-dropout recovery only): _cachedOVRVel.
+            // Used only when the position delta is invalid — either the previous
+            // step lost tracking (_prevRightValid=false) or the step distance
+            // exceeds MAX_STEP_M (implausible jump, would produce a ghost hit).
+            //
+            // OVRInput.GetLocalControllerVelocity() is intentionally NOT called here.
+            // It was read in Update() (where OVRInput is fresh), converted to world
+            // space, and stored in _cachedOVRVel / _cachedOVRFrame.  Calling it in
+            // FixedUpdate would read a stale duplicate on the second physics step
+            // within a frame (120 Hz physics / 72 Hz display).
             Vector3 posDelta = fp - _prevWorldPos;
             const float MAX_STEP_M = 0.2f;   // 0.2 m / (1/120 s) = 24 m/s — generous cap
-            bool  deltaValid = _prevRightValid && posDelta.magnitude <= MAX_STEP_M;
-            _paddleVelocity = ovrVel.sqrMagnitude > 0.0001f
-                ? ovrVel
-                : (deltaValid ? posDelta / Mathf.Max(Time.fixedDeltaTime, 0.0001f) : Vector3.zero);
-            _prevWorldPos    = fp;
-            _prevRightValid  = true;
+            bool deltaValid = _prevRightValid && posDelta.magnitude <= MAX_STEP_M;
+            Vector3 deltaVel = deltaValid
+                ? posDelta / Mathf.Max(Time.fixedDeltaTime, 0.0001f)
+                : Vector3.zero;
+            _paddleVelocity = deltaValid
+                ? deltaVel
+                : (_cachedOVRVel.sqrMagnitude > 0.0001f ? _cachedOVRVel : Vector3.zero);
+            _prevWorldPos   = fp;
+            _prevRightValid = true;
+
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            // ── VEL-PIPE diagnostic — rate-limited, every 60 physics steps ────
+            if (Time.frameCount % 60 == 0)
+            {
+                string src = deltaValid ? "delta" : (_cachedOVRVel.sqrMagnitude > 0.0001f ? "ovrCache" : "zero");
+                Debug.Log($"[VEL-PIPE] deltaVel={deltaVel:F3} ({deltaVel.magnitude:F3}m/s)  " +
+                          $"ovrCached={_cachedOVRVel:F3} ({_cachedOVRVel.magnitude:F3}m/s)  " +
+                          $"ovrFresh={_cachedOVRFrame == Time.frameCount}  " +
+                          $"src={src}  selected={_paddleVelocity.magnitude:F3}m/s  " +
+                          $"frame={Time.frameCount}");
+            }
+#endif
+
+            // World-space angular velocity of the right controller (wrist rotation).
+            // PRIMARY: delta-rotation method — always reliable.
+            //   OVRInput.GetLocalControllerAngularVelocity() returns zero on Quest 3
+            //   in this SDK version (confirmed by ANGULAR-SWEEP log: deltaRotDeg=18°
+            //   per step while API returns 0 rad/s).  Compute from rotation delta instead:
+            //     ω = axis * (angleDeg * Deg2Rad / fixedDeltaTime)
+            //   _prevPaddleRot is recorded before MoveRotation, _paddleRb.rotation is
+            //   updated immediately after — the difference is exactly this step's rotation.
+            {
+                // KEY: use `fr` (the target rotation just passed to MoveRotation), NOT
+                // _paddleRb.rotation.  For kinematic bodies, MoveRotation() does NOT
+                // update Rigidbody.rotation within the same FixedUpdate call — the
+                // property still returns the pre-move value until the next physics step.
+                // So _paddleRb.rotation × Inverse(_prevPaddleRot) = oldRot × oldRot⁻¹
+                // = identity → dDeg = 0 → zero angular velocity every frame.
+                // `fr` is the authoritative current-frame rotation: always correct.
+                Quaternion dRot = fr * Quaternion.Inverse(_prevPaddleRot);
+                dRot.ToAngleAxis(out float dDeg, out Vector3 dAxis);
+                // ToAngleAxis can return NaN axis when angle≈0 or quaternion is identity.
+                bool axisValid = dAxis.sqrMagnitude > 0.0001f
+                              && !float.IsNaN(dAxis.x) && !float.IsNaN(dAxis.y) && !float.IsNaN(dAxis.z);
+                _paddleAngularVelocity = axisValid
+                    ? dAxis.normalized * (dDeg * Mathf.Deg2Rad / Mathf.Max(Time.fixedDeltaTime, 0.0001f))
+                    : Vector3.zero;
+            }
+            // Spike filter: clamp to ANG_VEL_MAX (40 rad/s).
+            // Tracking dropouts produce single-frame rotation snaps that compute as
+            // 20–30+ rad/s.  Any real wrist flick peaks well below 40 rad/s.
+            // NOTE: OVRInput.GetLocalControllerAngularVelocity() returns zero on Quest 3
+            // in this SDK version — the OVR fallback branch has been removed as dead code.
+            _paddleAngularVelocity = Vector3.ClampMagnitude(_paddleAngularVelocity, ANG_VEL_MAX);
+
+            // ── Multi-frame angular spike guard ───────────────────────────────
+            // The hard cap above kills extreme spikes (> 40 rad/s).
+            // This catches medium spikes (5–15 rad/s) that occur when Quest 3
+            // tracking glitches produce a single-step rotation snap.
+            // A genuine fast wrist flick builds over consecutive steps and will
+            // NOT exceed ANG_SPIKE_RATIO × the previous smoothed magnitude.
+            // A glitch spike is isolated to one step and will.
+            {
+                float rawAngMag  = _paddleAngularVelocity.magnitude;
+                float prevSmooth = _smoothPaddleAngVel.magnitude;
+                if (prevSmooth > 0.5f && rawAngMag > prevSmooth * ANG_SPIKE_RATIO)
+                {
+                    _paddleAngularVelocity = rawAngMag > 1e-6f
+                        ? _paddleAngularVelocity.normalized * prevSmooth
+                        : Vector3.zero;
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+                    Debug.Log($"[VEL-SMOOTH] ANG_SPIKE clamped" +
+                              $"  raw={rawAngMag:F2} → {prevSmooth:F2} rad/s" +
+                              $"  frame={Time.frameCount}");
+#endif
+                }
+            }
+
+            // ── EMA smoothing ─────────────────────────────────────────────────
+            // Replaces both velocity fields with their exponential moving average.
+            // All downstream code (ApplyPaddleHit, swing guard, ANGULAR-SWEEP,
+            // HIT-DIAG) automatically uses the smoothed values — no changes needed
+            // elsewhere.
+            // Alphas are now inspector-tunable (velEmaAlpha / angEmaAlpha).
+            // Defaults: 0.35 linear (≈22 ms at 120 Hz), 0.25 angular (≈30 ms).
+            _smoothPaddleVel    = Vector3.Lerp(_smoothPaddleVel,    _paddleVelocity,        velEmaAlpha);
+            _smoothPaddleAngVel = Vector3.Lerp(_smoothPaddleAngVel, _paddleAngularVelocity, angEmaAlpha);
+            _paddleVelocity        = _smoothPaddleVel;
+            _paddleAngularVelocity = _smoothPaddleAngVel;
+
+            // ── NaN safety guard ──────────────────────────────────────────────
+            // A corrupted XR quaternion in the ToAngleAxis path can produce NaN.
+            // EMA would then propagate NaN indefinitely.  Detect and clear both
+            // fields so ApplyPaddleHit always receives finite values.
+            if (float.IsNaN(_paddleVelocity.x)        || float.IsNaN(_paddleVelocity.y)        || float.IsNaN(_paddleVelocity.z) ||
+                float.IsNaN(_paddleAngularVelocity.x)  || float.IsNaN(_paddleAngularVelocity.y)  || float.IsNaN(_paddleAngularVelocity.z))
+            {
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+                Debug.LogWarning($"[FREEZE-DIAG] NaN in velocity fields — cleared." +
+                                 $"  paddleVel={_paddleVelocity}  paddleAngVel={_paddleAngularVelocity}" +
+                                 $"  frame={Time.frameCount}");
+#endif
+                _paddleVelocity        = Vector3.zero;
+                _paddleAngularVelocity = Vector3.zero;
+                _smoothPaddleVel       = Vector3.zero;
+                _smoothPaddleAngVel    = Vector3.zero;
+            }
+
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            // ── PADDLE-FREEZE diagnostics (dev/editor only) ──────────────────
+            {
+                float pfLinSpd  = _paddleVelocity.magnitude;
+                float pfAngSpd  = _paddleAngularVelocity.magnitude;
+                float pfBallSpd = (_ballRb != null && !_ballRb.isKinematic)
+                                  ? _ballRb.linearVelocity.magnitude : 0f;
+
+                float pfSurfSpd = 0f;
+                if (_ballRb != null && paddleBox != null)
+                {
+                    Vector3 pfBoxCtr = paddleBox.transform.TransformPoint(paddleBox.center);
+                    pfSurfSpd = (_paddleVelocity
+                                 + Vector3.Cross(_paddleAngularVelocity, _ballRb.position - pfBoxCtr)).magnitude;
+                }
+
+                float pfPosErr      = (_paddleRb.position - _diagExpectedPaddlePos).magnitude;
+                float pfRotErr      = Quaternion.Angle(_paddleRb.rotation, _diagExpectedPaddleRot);
+                float pfRbTrPosDiff = (_paddleRb.position - paddle.transform.position).magnitude;
+                float pfRbTrRotDiff = Quaternion.Angle(_paddleRb.rotation, paddle.transform.rotation);
+                float pfBallPaddleDist = (_ballRb != null)
+                    ? (_ballRb.position - _paddleRb.position).magnitude : float.MaxValue;
+
+                bool pfVelFreeze = _diagPrevLinVelMag > 1.0f && pfLinSpd < 0.3f && pfBallPaddleDist < 0.4f;
+                bool pfAngSpike  = pfAngSpd > 20f;
+
+                // NonAlloc OverlapBox — no per-frame Collider[] allocation.
+                int     pfOverlapCount = 0;
+                bool    pfPenHit       = false;
+                float   pfPenDepth     = 0f;
+                Vector3 pfPenDir       = Vector3.zero;
+                if (paddleBox != null)
+                {
+                    Vector3 pfBoxCtr2 = paddleBox.transform.TransformPoint(paddleBox.center);
+                    pfOverlapCount = Physics.OverlapBoxNonAlloc(
+                        pfBoxCtr2, paddleBox.size * 0.5f, _overlapBuffer,
+                        _paddleRb.rotation, ~0, QueryTriggerInteraction.Ignore);
+                    if (_ballCollider != null && _ballRb != null)
+                    {
+                        try
+                        {
+                            pfPenHit = Physics.ComputePenetration(
+                                _ballCollider, _ballRb.position, Quaternion.identity,
+                                paddleBox, paddleBox.transform.position, paddleBox.transform.rotation,
+                                out pfPenDir, out pfPenDepth);
+                        }
+                        catch { }
+                    }
+                }
+
+                bool pfHighSpeed   = pfSurfSpd > 5f || (pfBallSpd > 6f && pfBallPaddleDist < 0.4f);
+                bool pfPosStall    = pfPosErr > 0.005f;
+                bool pfRotStall    = pfRotErr > 5f;
+                bool pfDeepPen     = pfPenHit && pfPenDepth > 0.01f;
+                bool pfRbTrDiverge = pfRbTrRotDiff > 5f || pfRbTrPosDiff > 0.002f;
+                bool pfShouldLog   = pfVelFreeze || pfAngSpike || pfPosStall || pfRotStall
+                                   || pfDeepPen  || pfRbTrDiverge || pfHighSpeed;
+
+                if (pfShouldLog)
+                {
+                    string pfReason = "";
+                    if (pfVelFreeze)   pfReason += "VELOCITY_FREEZE ";
+                    if (pfAngSpike)    pfReason += "ANG_SPIKE ";
+                    if (pfPosStall)    pfReason += "POS_STALL ";
+                    if (pfRotStall)    pfReason += "ROT_STALL ";
+                    if (pfDeepPen)     pfReason += "DEEP_PEN ";
+                    if (pfRbTrDiverge) pfReason += "RBTRANSFORM_DIVERGE ";
+                    if (pfHighSpeed)   pfReason += "HIGH_SPEED ";
+                    Debug.Log($"[PADDLE-FREEZE] {pfReason}" +
+                              $"\n  frame={Time.frameCount}  fixedTime={Time.fixedTime:F4}" +
+                              $"\n  targetPos={fp:F4}  targetRot={fr.eulerAngles:F2}" +
+                              $"\n  rbPos={_paddleRb.position:F4}  rbRot={_paddleRb.rotation.eulerAngles:F2}" +
+                              $"\n  posErr={pfPosErr:F5} m  rotErr={pfRotErr:F2}°  rbTrPos={pfRbTrPosDiff:F5}  rbTrRot={pfRbTrRotDiff:F2}°" +
+                              $"\n  linVel={_paddleVelocity:F3} ({pfLinSpd:F3} m/s)  angVel={_paddleAngularVelocity:F3} ({pfAngSpd:F3} r/s)  surf={pfSurfSpd:F3}" +
+                              $"\n  ballSpd={pfBallSpd:F3}  dist={pfBallPaddleDist:F3}  overlapCount={pfOverlapCount}  penHit={pfPenHit}  penDepth={pfPenDepth:F5}");
+                }
+
+                _diagPrevLinVelMag     = pfLinSpd;
+                _diagPrevAngVelMag     = pfAngSpd;
+                _diagExpectedPaddlePos = fp;
+                _diagExpectedPaddleRot = fr;
+            }
+            // ── END PADDLE-FREEZE diagnostics ────────────────────────────────
+#endif
         }
         else
         {
@@ -536,12 +1081,29 @@ public class gameplay : MonoBehaviour
         }
 
         // ── Hit detection ─────────────────────────────────────────────────────
-        if (!_trackingReady || !_rightValid || ball == null || _ballRb == null)
+        _diagHitDetStart = Time.realtimeSinceStartup;
+        if (ball == null || _ballRb == null)
         {
-            _prevBallPos = (_ballRb != null) ? _ballRb.position : Vector3.zero;
+            _prevBallPos = Vector3.zero;
             return;
         }
-        if (!ExperimentLogger.SessionActive || !_hitWindowOpen || paddleBox == null)
+        // ── Hit-window diagnostic (once per second, fires BEFORE all gates) ─────
+        if (Time.time > _hitDiagLastLog + 1f)
+        {
+            _hitDiagLastLog = Time.time;
+            Debug.Log($"[HIT-DIAG] trackingReady={_trackingReady} rightValid={_rightValid} " +
+                      $"sessionActive={ExperimentLogger.SessionActive} " +
+                      $"hitWindowOpen={_hitWindowOpen} paddleBox={(paddleBox != null ? "ok" : "NULL")} " +
+                      $"separated={_ballSeparated} kinematic={_ballRb.isKinematic} " +
+                      $"ballY={_ballRb.position.y:F2}");
+        }
+
+        if (!_trackingReady || !_rightValid)
+        {
+            _prevBallPos = _ballRb.position;
+            return;
+        }
+        if ((!jugglingMode && (!ExperimentLogger.SessionActive || !_hitWindowOpen)) || paddleBox == null)
         {
             _prevBallPos = _ballRb.position;
             return;
@@ -569,15 +1131,31 @@ public class gameplay : MonoBehaviour
             if (distToTable < _minPaddleTableDistThisServe)
                 _minPaddleTableDistThisServe = distToTable;
 
-            // ── PaddleTableContact: edge-detect — only on entering edge ───────
-            bool nowBelow = distToTable < 0f;
-            if (nowBelow && _paddleWasAboveTable)
+            // ── PaddleTableContact: edge-detect — fires on entering edge ─────────
+            // Proximity buffer of 0.015 m (1.5 cm): fires when paddle bottom is
+            // within 1.5 cm of the table surface (above OR below) so that a light
+            // touch triggers haptics without requiring hard pressing.
+            // penetration is 0 when paddle is still above but within buffer,
+            // and positive when it has crossed below the surface.
+            const float PADDLE_TABLE_PROXIMITY = 0.015f;
+            bool nowNearOrBelow = distToTable < PADDLE_TABLE_PROXIMITY;
+            if (nowNearOrBelow && _paddleWasAboveTable)
             {
-                float penetration = -distToTable;
+                float penetration = Mathf.Max(0f, -distToTable);
                 ExperimentLogger.Instance?.LogPaddleTableContact(penetration);
-                Debug.Log($"[gameplay] PaddleTableContact penetration={penetration:F4} m");
+                OnPaddleTableContact?.Invoke(penetration);
+                Debug.Log(
+                    $"[PADDLE-TABLE] detected" +
+                    $" depth={penetration:F4}" +
+                    $" distToTable={distToTable:F4}" +
+                    $" eventInvoked=true" +
+                    $" tableTopY={_tableTopY:F4}" +
+                    $" paddleBottomY={paddleBottomY:F4}" +
+                    $" sessionActive={ExperimentLogger.SessionActive}" +
+                    $" group={ExperimentLogger.GroupNumber}"
+                );
             }
-            _paddleWasAboveTable = !nowBelow;
+            _paddleWasAboveTable = !nowNearOrBelow;
         }
 
         // ── Belt-and-suspenders: re-enforce CCD settings every frame ─────────────
@@ -597,146 +1175,114 @@ public class gameplay : MonoBehaviour
 
         Vector3 ballPos = _ballRb.position;
 
-        // ClosestPoint returns the ball center itself when the ball is fully inside
-        // the box (dist = 0).  Each layer below re-evaluates the cooldown directly
-        // from _lastHitTime so a hit registered by an earlier layer is immediately
-        // visible to the later layers in the same FixedUpdate call.
+        // ── Reset per-step diagnostic state ───────────────────────────────────
+        _diagL0State = _diagL1State = _diagL2State = _diagL3State = _diagL4State = 0;
+        _diagApplyHitCalledThisStep = false;
+        _diagSwingGuardRejected     = false;
+
+        // ── Unified paddle motion model ───────────────────────────────────────
+        // Computed ONCE here.  Every geometry finder and ApplyPaddleHit receive
+        // paddleBoxCenter directly — no layer re-derives it from Rigidbody pose.
+        //
+        //   paddleBoxCenter   — world-space centre of the paddle BoxCollider
+        //   surfaceVelAt(pt)  — _paddleVelocity + ω × (pt − paddleBoxCenter)
+        //
+        // _paddleAngularVelocity was already clamped to ANG_VEL_MAX above.
+        // TransformPoint(paddleBox.center) is child-safe: correctly handles
+        // paddleBox on a child GameObject (unlike _paddleRb.position + rotation * center
+        // which ignores the child's world offset).
+        Vector3 paddleBoxCenter = paddleBox.transform.TransformPoint(paddleBox.center);
+
+        // ── Ball-to-surface distance — used by separation update below ─────────
+        // ClosestPoint returns the ball centre when ball is fully inside (dist=0).
         Vector3 closest = paddleBox.ClosestPoint(ballPos);
         float   dist    = Vector3.Distance(closest, ballPos);
 
-        // ── Hit detection: four layers, each re-checks cooldown from _lastHitTime ──
+        // ── Session gate ───────────────────────────────────────────────────────
+        bool hitOpen = Time.time > _lastHitTime + HIT_COOLDOWN && _ballSeparated;
+
+        // ────────────────────────────────────────────────────────────────────────
+        // HIT DETECTION — two-path architecture
         //
-        // ApplyPaddleHit updates _lastHitTime immediately, so every layer after
-        // the first that fires will see a fresh cooldown and skip — naturally
-        // preventing double-fires without any shared bool.
-
-        // ── Layer 0 — OverlapBox (current frame) ─────────────────────────────────
-        // Checks whether the ball is physically INSIDE the paddle volume right now.
-        // This catches ALL tunneling scenarios that Layers 1-3 can miss:
-        //   • Relative-motion tunneling: ball and paddle both flying fast toward each
-        //     other so neither center sweep covers the crossing.
-        //   • Pure rotational swing: wrist flick moves the paddle face through a large
-        //     arc while the center barely translates → Layer 3 BoxCastAll sweep is tiny.
-        // Run this before every other layer so tunneled balls get fixed up immediately.
-        // _ballSeparated: only fire if ball has left the paddle zone since the last hit.
-        if (Time.time > _lastHitTime + HIT_COOLDOWN && _ballSeparated)
-        {
-            // Use Rigidbody position/rotation — NOT the Transform — as the single
-            // source of truth for where the physics collider actually is.
-            // Transform can lag the Rigidbody when interpolation is enabled, and
-            // any stale transform write from outside FixedUpdate would cause a mismatch.
-            Vector3    rbBoxCtr = _paddleRb.position + _paddleRb.rotation * paddleBox.center;
-            Quaternion rbRot    = _paddleRb.rotation;
-            // Half extents: paddle box size × lossyScale, then add 1 cm margin on
-            // every axis.  The margin catches balls whose centres are just outside
-            // a corner/edge by a few mm — enough to prevent rare missed contacts
-            // without creating false ghost hits (those are already gated by
-            // _ballSeparated and HIT_COOLDOWN).
-            const float OVERLAP_MARGIN = 0.01f;   // 1 cm — ball radius is ~2 cm
-            Vector3 halfExt = Vector3.Scale(paddleBox.size * 0.5f,
-                                  new Vector3(
-                                      Mathf.Abs(paddleBox.transform.lossyScale.x),
-                                      Mathf.Abs(paddleBox.transform.lossyScale.y),
-                                      Mathf.Abs(paddleBox.transform.lossyScale.z)))
-                              + Vector3.one * OVERLAP_MARGIN;
-            Collider[] overlaps = Physics.OverlapBox(
-                rbBoxCtr, halfExt, rbRot,
-                ~0, QueryTriggerInteraction.Ignore);
-            foreach (var oc in overlaps)
-            {
-                if (oc.attachedRigidbody == _ballRb)
-                {
-                    ApplyPaddleHit(paddleBox.ClosestPoint(ballPos));
-                    Debug.Log($"[gameplay] HIT via OverlapBox padVel={_paddleVelocity.magnitude:F1}");
-                    break;
-                }
-            }
-        }
-
-        // ── Layer 1 — proximity + surface-velocity approach guard ─────────────────
-        // Distance alone causes ghost hits (ball jumps away before the paddle face
-        // visually arrives).  The approach guard prevents this by requiring that
-        // either the ball or paddle is genuinely moving toward contact.
+        // PRIMARY : OnPaddlePhysicsHit (Layer 4) — physics engine collision callback.
+        //           Fires on contact INITIATION via ContinuousSpeculative sweep.
+        //           Provides authoritative contact point and normal from the solver.
+        //           Runs AFTER FixedUpdate in the same physics step.
         //
-        // IMPORTANT: use SURFACE velocity, not just center velocity.
-        // During a fast wrist flick, the paddle center barely moves (~0 m/s) but the
-        // blade face sweeps at 2–5 m/s.  v_surface = v_center + ω × r, where r is
-        // the lever arm from the paddle box center to the contact point.
-        if (dist < HIT_RADIUS && Time.time > _lastHitTime + HIT_COOLDOWN && _ballSeparated)
+        // FALLBACK: ComputePenetration (below) — handles pre-existing overlaps only.
+        //           If the ball already overlaps the paddle at the START of this step,
+        //           no new contact event fires from ContinuousSpeculative.
+        //           Physics.ComputePenetration returns the minimum-separation vector —
+        //           the physics engine's own answer to "which direction is out?" —
+        //           used directly as the contact normal (no geometry heuristics).
+        //
+        // All previous geometry finders (OverlapBox, Proximity, SphereCast, BoxCastAll)
+        // have been removed.  They reconstructed contact normals from ClosestPoint
+        // geometry — an approximation that produced wrong-face snaps on edge/rim
+        // contacts and unstable results when the ball was inside the paddle volume.
+        // ────────────────────────────────────────────────────────────────────────
+
+        // ── ComputePenetration fallback — pre-existing ball-in-paddle overlap ───
+        if (hitOpen && _ballCollider != null && !_ballRb.isKinematic)
         {
-            Vector3 towardPaddle = closest - ballPos;
-            float   tpLen        = towardPaddle.magnitude;
-            Vector3 tpDir        = tpLen > 1e-5f ? towardPaddle / tpLen : Vector3.zero;
-
-            // Angular velocity in world space (OVR gives local-controller space).
-            Vector3 ovrAngVel = Vector3.zero;
-            try { ovrAngVel = _rightRot * OVRInput.GetLocalControllerAngularVelocity(OVRInput.Controller.RTouch); } catch { }
-
-            // Lever arm from the paddle box world-centre to the contact point.
-            // Use Rigidbody position/rotation — not Transform — for consistency with Layer 0.
-            Vector3 boxCtr      = _paddleRb.position + _paddleRb.rotation * paddleBox.center;
-            Vector3 leverArm    = closest - boxCtr;
-            Vector3 surfaceVel  = _paddleVelocity + Vector3.Cross(ovrAngVel, leverArm);
-
-            float padApproach  = Vector3.Dot(surfaceVel, tpDir);               // >0: surface moving toward ball
-            float ballApproach = Vector3.Dot(_ballRb.linearVelocity, tpDir);   // >0: ball moving toward paddle
-
-            // Threshold lowered from 0.3 → 0.05 m/s.
-            // The original 0.3 f guard was over-conservative: for a pure wrist flick
-            // the linear centre velocity is near-zero and Cross(ovrAngVel, leverArm)
-            // can be near-perpendicular to tpDir for edge contacts, giving padApproach
-            // ≈ 0 even though the face is sweeping at 4–5 m/s.
-            // _ballSeparated (set false in ApplyPaddleHit until ball exits 8 cm) is
-            // already the primary multi-fire guard, so this can safely be very loose.
-            if (padApproach > 0.05f || ballApproach > 0.05f)
-                ApplyPaddleHit(closest);
-        }
-
-        // ── Layer 2 — ball-path SphereCast ───────────────────────────────────────
-        // Catches fast-moving BALL that travels entirely through the paddle in one
-        // physics step.  Uses hit.point (the actual surface crossing point) rather
-        // than ClosestPoint(ballPos) which returns the wrong face when the ball is
-        // already on the far side.
-        if (Time.time > _lastHitTime + HIT_COOLDOWN && _prevBallPosValid && _ballSeparated)
-        {
-            Vector3 sweepDir = ballPos - _prevBallPos;
-            float   sweepLen = sweepDir.magnitude;
-            if (sweepLen > 0.001f &&
-                Physics.SphereCast(_prevBallPos, 0.02f, sweepDir / sweepLen,
-                    out RaycastHit hit, sweepLen) &&
-                hit.collider == paddleBox)
+            _diagL0State = 1; // open — checking overlap
+            Vector3 cpSepDir; float cpSepDist;
+            // Use paddleBox.transform.position/rotation — correct when paddleBox is
+            // on a child GameObject.  _paddleRb.position ignores child offsets.
+            bool overlapping = Physics.ComputePenetration(
+                _ballCollider, ballPos,                          Quaternion.identity,
+                paddleBox,     paddleBox.transform.position,     paddleBox.transform.rotation,
+                out cpSepDir,  out cpSepDist);
+            if (overlapping && cpSepDir.sqrMagnitude > 0.5f)
             {
-                ApplyPaddleHit(hit.point);
-                Debug.Log($"[gameplay] HIT via ball-sweep padVel={_paddleVelocity.magnitude:F1}");
-            }
-        }
-
-        // ── Layer 3 — paddle-sweep BoxCastAll ────────────────────────────────────
-        // Catches fast-swinging PADDLE translating through a slow/stationary ball.
-        // Uses the BoxCollider's actual world-centre (not the Rigidbody pivot) and
-        // BoxCastAll so a table or net hit earlier in the sweep doesn't hide the ball.
-        // Note: this layer handles TRANSLATIONAL sweeps.  ROTATIONAL fast swings are
-        // covered by Layer 0 (OverlapBox) which runs every frame regardless.
-        if (Time.time > _lastHitTime + HIT_COOLDOWN && _prevPaddlePosValid && _ballSeparated)
-        {
-            Vector3 paddleDelta   = _currentPaddlePos - _prevPaddlePos;
-            float   paddleMoveLen = paddleDelta.magnitude;
-            if (paddleMoveLen > 0.001f)
-            {
-                Vector3      halfExt3    = paddleBox.size * 0.5f;
-                Vector3      prevBoxCtr  = _prevPaddlePos + _prevPaddleRot * paddleBox.center;
-                RaycastHit[] allHits     = Physics.BoxCastAll(
-                    prevBoxCtr, halfExt3, paddleDelta.normalized,
-                    _prevPaddleRot, paddleMoveLen,
-                    ~0, QueryTriggerInteraction.Ignore);
-                foreach (var bHit in allHits)
+                cpSepDir = cpSepDir.normalized;
+                // Face restriction: accept only contacts within 60° of the playing face.
+                // The rubber face axis = pForward after paddleRotationOffset is applied.
+                // Abs-dot ≥ 0.5 accepts the full face including closed topspin angles;
+                // rejects handle, rim, and rear-face contacts.
+                Vector3 pFwd      = _paddleRb.rotation * Vector3.forward;
+                float   faceAlign = Mathf.Abs(Vector3.Dot(cpSepDir, pFwd));
+                if (faceAlign >= 0.5f)
                 {
-                    if (bHit.rigidbody == _ballRb)
+                    Vector3 cpContactPt = ballPos - cpSepDir * cpSepDist;
+                    Vector3 cpSurfVel   = _paddleVelocity
+                                        + Vector3.Cross(_paddleAngularVelocity,
+                                                        cpContactPt - paddleBoxCenter);
+                    if (cpSurfVel.magnitude >= SWING_MIN)
                     {
-                        ApplyPaddleHit(bHit.point);
-                        Debug.Log($"[gameplay] HIT via BoxCast padVel={paddleMoveLen / Time.fixedDeltaTime:F1}");
-                        break;
+                        _diagL0State   = 2;
+                        _diagLayer     = "Layer_ComputePen";
+                        _diagSweepDist = cpSepDist;
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+                        Debug.DrawRay(ballPos,     cpSepDir * (cpSepDist + 0.06f), new Color(1f, 0.5f, 0f), 2f);
+                        Debug.DrawRay(cpContactPt, cpSepDir * 0.12f,               new Color(1f, 0.5f, 0f), 2f);
+                        Debug.Log($"[HIT-SOURCE] path=Layer_ComputePen  " +
+                                  $"faceAlign={faceAlign:F3}  sepDist={cpSepDist:F4}  " +
+                                  $"contactPt={cpContactPt:F3}  normal={cpSepDir:F3}  " +
+                                  $"ballVelBefore={(_ballRb != null ? _ballRb.linearVelocity.ToString("F3") : "null")}  " +
+                                  $"ballSpd={(_ballRb != null ? _ballRb.linearVelocity.magnitude : 0f):F3}m/s  " +
+                                  $"paddleVel={_paddleVelocity.magnitude:F3}m/s  frame={Time.frameCount}");
+#endif
+                        Vector3 cpFaceNormal = SnapToPaddleFaceNormal(cpSepDir, pFwd, "Layer_ComputePen");
+                        ApplyPaddleHit(cpContactPt, cpFaceNormal, paddleBoxCenter);
                     }
+                    else
+                    {
+                        _diagSwingGuardRejected = true;
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+                        Debug.Log($"[HIT-DIAG] SWING_GUARD_REJECT layer=ComputePen" +
+                                  $"  surfSpd={cpSurfVel.magnitude:F3} < SWING_MIN={SWING_MIN}" +
+                                  $"  faceAlign={faceAlign:F3}  frame={Time.frameCount}");
+#endif
+                    }
+                }
+                else
+                {
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+                    Debug.Log($"[HIT-DIAG] FACE_REJECT layer=ComputePen" +
+                              $"  faceAlign={faceAlign:F3}  sepDir={cpSepDir:F3}" +
+                              $"  frame={Time.frameCount}");
+#endif
                 }
             }
         }
@@ -747,8 +1293,150 @@ public class gameplay : MonoBehaviour
         if (!_ballSeparated && dist > SEPARATION_DIST)
             _ballSeparated = true;
 
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+        // ── Pass-through detection ────────────────────────────────────────────
+        if (_ballRb != null && !_ballRb.isKinematic && paddleBox != null && _prevPaddlePosValid)
+        {
+            Vector3 faceNormal  = _paddleRb.rotation * Vector3.forward;
+            Vector3 paddleCtr   = paddleBox.transform.TransformPoint(paddleBox.center);
+            float   ballFaceSgn = Vector3.Dot(ballPos - paddleCtr, faceNormal);
+            float   ptDistToSurf = Vector3.Distance(paddleBox.ClosestPoint(ballPos), ballPos);
+            bool hitThisStep = (_lastHitFrame == Time.frameCount);
+            if (!hitThisStep && _diagPrevBallFaceSign != 0f
+                && Mathf.Sign(ballFaceSgn) != Mathf.Sign(_diagPrevBallFaceSign)
+                && ptDistToSurf < 0.05f)
+            {
+                Debug.Log($"[HIT-DIAG][PASS-THROUGH] Ball crossed paddle face without a hit!" +
+                          $"  prevSign={_diagPrevBallFaceSign:F4}  curSign={ballFaceSgn:F4}" +
+                          $"  distToSurf={ptDistToSurf:F4}" +
+                          $"  ballSpd={_ballRb.linearVelocity.magnitude:F3}" +
+                          $"  surf={(_paddleVelocity + Vector3.Cross(_paddleAngularVelocity, ballPos - paddleCtr)).magnitude:F3}" +
+                          $"  frame={Time.frameCount}");
+            }
+            _diagPrevBallFaceSign = ballFaceSgn;
+        }
+
+        // ── Rb / Transform rotation divergence warning ────────────────────────
+        if (_paddleRb != null && paddle != null)
+        {
+            float rotDiv = Quaternion.Angle(_paddleRb.rotation, paddle.transform.rotation);
+            if (rotDiv > 5f)
+                Debug.Log($"[HIT-DIAG][ROT-DIVERGENCE] {rotDiv:F2}°  " +
+                          $"rb={_paddleRb.rotation.eulerAngles:F1}  tr={paddle.transform.rotation.eulerAngles:F1}");
+        }
+        // ── END pass-through / divergence checks ─────────────────────────────
+#endif
+
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+        // ── ANGULAR_SWEEP diagnostic ──────────────────────────────────────────
+        if (_ballRb != null && !_ballRb.isKinematic && paddleBox != null && _rightValid)
+        {
+            Vector3 asFwd = _paddleRb.rotation * Vector3.forward;
+            Vector3 asCtr = paddleBox.transform.TransformPoint(paddleBox.center);
+
+            float asCurrFaceDot  = Vector3.Dot(ballPos - asCtr, asFwd);
+            float asPrevFaceDot  = _diagPrevFaceDotAS;
+            bool  asCrossedPlane = (_diagPrevFaceDotAS != 0f)
+                && (Mathf.Sign(asCurrFaceDot) != Mathf.Sign(asPrevFaceDot));
+
+            float asDeltaRotDeg = Quaternion.Angle(_diagPrevPaddleRotAS, _paddleRb.rotation);
+            float asAngVelMag   = _paddleAngularVelocity.magnitude;
+
+            // Max corner velocity — uses pre-allocated _cornersCache (no per-step array alloc).
+            float   asMaxCornerSpd = 0f;
+            Vector3 asMaxCornerVel = Vector3.zero;
+            {
+                Vector3 hs = Vector3.Scale(paddleBox.size * 0.5f,
+                                 new Vector3(
+                                     Mathf.Abs(paddleBox.transform.lossyScale.x),
+                                     Mathf.Abs(paddleBox.transform.lossyScale.y),
+                                     Mathf.Abs(paddleBox.transform.lossyScale.z)));
+                _cornersCache[0] = new Vector3(+hs.x, +hs.y, +hs.z);
+                _cornersCache[1] = new Vector3(+hs.x, +hs.y, -hs.z);
+                _cornersCache[2] = new Vector3(+hs.x, -hs.y, +hs.z);
+                _cornersCache[3] = new Vector3(+hs.x, -hs.y, -hs.z);
+                _cornersCache[4] = new Vector3(-hs.x, +hs.y, +hs.z);
+                _cornersCache[5] = new Vector3(-hs.x, +hs.y, -hs.z);
+                _cornersCache[6] = new Vector3(-hs.x, -hs.y, +hs.z);
+                _cornersCache[7] = new Vector3(-hs.x, -hs.y, -hs.z);
+                foreach (var c in _cornersCache)
+                {
+                    Vector3 wc   = asCtr + _paddleRb.rotation * c;
+                    Vector3 cVel = _paddleVelocity + Vector3.Cross(_paddleAngularVelocity, wc - asCtr);
+                    float   cSpd = cVel.magnitude;
+                    if (cSpd > asMaxCornerSpd) { asMaxCornerSpd = cSpd; asMaxCornerVel = cVel; }
+                }
+            }
+
+            float   tipHalfY  = paddleBox.size.y * 0.5f * Mathf.Abs(paddleBox.transform.lossyScale.y);
+            Vector3 tipOffset = _paddleRb.rotation * new Vector3(0f, tipHalfY, 0f);
+            Vector3 asTipVel  = _paddleVelocity + Vector3.Cross(_paddleAngularVelocity, tipOffset);
+
+            float asFwdDeltaDeg = _diagPrevPaddleFwdAS == Vector3.zero
+                ? 0f : Vector3.Angle(_diagPrevPaddleFwdAS, asFwd);
+
+            float asDistToSurf = Vector3.Distance(paddleBox.ClosestPoint(ballPos), ballPos);
+
+            const float AS_ANG_VEL_THRESH  = 3.0f;
+            const float AS_EDGE_SPD_THRESH = 1.5f;
+            const float AS_PROX_NEAR       = 0.05f;
+            const float AS_PROX_SWING      = 0.30f;
+            bool asFire =
+                (asAngVelMag    > AS_ANG_VEL_THRESH  && asDistToSurf < AS_PROX_SWING) ||
+                (asMaxCornerSpd > AS_EDGE_SPD_THRESH  && asDistToSurf < AS_PROX_SWING) ||
+                (asCrossedPlane && !_diagApplyHitCalledThisStep && asDistToSurf < AS_PROX_NEAR);
+
+            if (asFire)
+            {
+                string asL0 = _diagL0State == 2 ? "FIRED" : _diagL0State == 1 ? "OPEN_NO_HIT" : "LOCKED";
+                string asL1 = _diagL1State == 2 ? "FIRED" : _diagL1State == 1 ? "OPEN_NO_HIT" : "LOCKED";
+                string asL2 = _diagL2State == 2 ? "FIRED" : _diagL2State == 1 ? "OPEN_NO_HIT" : "LOCKED";
+                string asL3 = _diagL3State == 2 ? "FIRED" : _diagL3State == 1 ? "OPEN_NO_HIT" : "LOCKED";
+                string asL4 = _diagL4State == 2 ? "FIRED" : _diagL4State == 1 ? "OPEN_NO_HIT" : "LOCKED";
+                string asBlocked = "";
+                if (!_diagApplyHitCalledThisStep)
+                {
+                    if (_diagSwingGuardRejected)
+                        asBlocked = "SWING_GUARD_REJECTED";
+                    else
+                    {
+                        bool anyOpen = _diagL0State >= 1 || _diagL1State >= 1
+                                    || _diagL2State >= 1 || _diagL3State >= 1 || _diagL4State >= 1;
+                        asBlocked = anyOpen ? "OPEN_BUT_GEOMETRY_MISS" : "ALL_LOCKED(cooldown_or_sep)";
+                    }
+                }
+                Debug.Log(
+                    "[ANGULAR-SWEEP] " +
+                    $"frame={Time.frameCount}  fixedTime={Time.fixedTime:F4}\n" +
+                    $"BALL  prevPos={_prevBallPos:F4}  currPos={ballPos:F4}  vel={_ballRb.linearVelocity:F4} ({_ballRb.linearVelocity.magnitude:F3} m/s)\n" +
+                    $"PADDLE  prevRot={_diagPrevPaddleRotAS.eulerAngles:F2}  currRot={_paddleRb.rotation.eulerAngles:F2}  dRot={asDeltaRotDeg:F2}  angVel={asAngVelMag:F3} r/s\n" +
+                    $"EDGE  tip={asTipVel.magnitude:F3}  max={asMaxCornerSpd:F3} m/s  fwdDelta={asFwdDeltaDeg:F2}°\n" +
+                    $"PLANE  prevDot={asPrevFaceDot:F4}  currDot={asCurrFaceDot:F4}  crossed={asCrossedPlane}  dist={asDistToSurf:F4}\n" +
+                    $"LAYERS  L0={asL0}  L1={asL1}  L2={asL2}  L3={asL3}  L4={asL4}\n" +
+                    $"ARBIT  called={_diagApplyHitCalledThisStep}  blocked={asBlocked}\n" +
+                    $"NORMAL  raw={_diagLastRawNormal:F4}  snapped={_diagLastSnappedNormal:F4}  flipped={_diagLastNormalFlipped}\n" +
+                    $"FINAL  assigned={_diagLastAssignedVel:F4}  ballVel={_diagLastFinalBallVel:F4}"
+                );
+            }
+
+            _diagPrevPaddleRotAS = _paddleRb.rotation;
+            _diagPrevPaddleFwdAS = asFwd;
+            _diagPrevFaceDotAS   = asCurrFaceDot;
+        }
+        // ── END ANGULAR_SWEEP ─────────────────────────────────────────────────
+#endif
+
         _prevBallPos      = ballPos;
         _prevBallPosValid = !_ballRb.isKinematic;
+
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+        // ── FixedUpdate / hit-detection timing ───────────────────────────────
+        float diagHitDetMs     = (Time.realtimeSinceStartup - _diagHitDetStart)     * 1000f;
+        float diagFixedTotalMs = (Time.realtimeSinceStartup - _diagFixedUpdateStart) * 1000f;
+        if (diagFixedTotalMs > 5f || diagHitDetMs > 3f)
+            Debug.Log($"[PADDLE-FREEZE][TIMING] FixedUpdate total={diagFixedTotalMs:F3} ms  " +
+                      $"hitDetection={diagHitDetMs:F3} ms  frame={Time.frameCount}");
+#endif
     }
 
     // Called by PaddleHitForwarder when the physics engine detects a collision
@@ -756,151 +1444,200 @@ public class gameplay : MonoBehaviour
     // This is Layer 4 — catches any fast swing that slips past all three FixedUpdate layers.
     public void OnPaddlePhysicsHit(Collision col)
     {
-        if (!_hitWindowOpen || !ExperimentLogger.SessionActive) return;
+        if (!jugglingMode && (!_hitWindowOpen || !ExperimentLogger.SessionActive)) return;
         if (ball == null || col.gameObject != ball) return;
         if (_ballRb == null || Time.time < _lastHitTime + HIT_COOLDOWN) return;
-        if (!_ballSeparated) return;   // still in same contact session — separation required
-
-        // Layer 4 — physics engine contact (ContinuousSpeculative).
-        // OnCollisionEnter fires AFTER FixedUpdate in the same physics step.
-        // This means Time.time is identical to when a FixedUpdate layer just set
-        // _lastHitTime, so the time-based cooldown alone cannot block a same-step
-        // double-fire (Time.time < _lastHitTime + 0.08 evaluates to 0 < 0.08 → true,
-        // but the subtraction yields exactly 0, so the guard fails).
-        // The frame check closes this gap: if FixedUpdate already registered a hit
-        // in this physics step, _lastHitFrame == Time.frameCount and we skip.
+        if (!_ballSeparated) return;
+        // Frame guard: OnCollisionEnter fires AFTER FixedUpdate in the same physics
+        // step — Time.time is identical so the time-based cooldown cannot block a
+        // same-step double-fire.  The frame check closes this gap.
         if (Time.frameCount == _lastHitFrame) return;
-        Vector3 contactPt = col.contactCount > 0
-            ? col.GetContact(0).point
-            : (paddleBox != null ? paddleBox.ClosestPoint(_ballRb.position) : paddle.transform.position);
+        if (col.contactCount == 0) return;
 
-        ApplyPaddleHit(contactPt);
-        Debug.Log($"[gameplay] HIT via physics collision padVel={_paddleVelocity.magnitude:F1}");
+        // ── Physics-engine contact point and normal — primary authority ───────
+        // col.GetContact(0).normal points FROM the paddle surface TOWARD the ball
+        // centre — the correct outward normal for our reflection formula.
+        // This is computed by the ContinuousSpeculative solver and is always more
+        // reliable than any manual ClosestPoint / geometry heuristic.
+        ContactPoint cp            = col.GetContact(0);
+        Vector3      contactPt     = cp.point;
+        Vector3      contactNormal = cp.normal.sqrMagnitude > 0.5f
+                                     ? cp.normal.normalized
+                                     : Vector3.zero;
+        if (contactNormal == Vector3.zero)
+        {
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            Debug.Log($"[gameplay] Layer4 — zero/degenerate contact normal from physics engine, skipping.  frame={Time.frameCount}");
+#endif
+            return;
+        }
+
+        // ── Face restriction ───────────────────────────────────────────────────
+        Vector3 pFwd      = _paddleRb.rotation * Vector3.forward;
+        float   faceAlign = Mathf.Abs(Vector3.Dot(contactNormal, pFwd));
+        if (faceAlign < 0.5f)
+        {
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            Debug.Log($"[gameplay] Layer4 face-reject — faceAlign={faceAlign:F3}  " +
+                      $"normal={contactNormal:F3}  pFwd={pFwd:F3}  frame={Time.frameCount}");
+#endif
+            return;
+        }
+
+        // ── Swing guard ────────────────────────────────────────────────────────
+        Vector3 l4BoxCenter  = paddleBox != null
+                             ? paddleBox.transform.TransformPoint(paddleBox.center)
+                             : _paddleRb.position;
+        Vector3 l4SurfaceVel = _paddleVelocity
+                             + Vector3.Cross(_paddleAngularVelocity, contactPt - l4BoxCenter);
+        if (l4SurfaceVel.magnitude < SWING_MIN)
+        {
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            Debug.Log($"[gameplay] Layer4 ghost blocked — surfVel={l4SurfaceVel.magnitude:F3} < SWING_MIN={SWING_MIN}");
+#endif
+            return;
+        }
+
+        _diagLayer = "Layer4_Physics"; _diagSweepDist = 0f; _diagL4State = 2;
+        Vector3 l4FaceNormal = SnapToPaddleFaceNormal(contactNormal, pFwd, "Layer4_Physics");
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+        Debug.DrawRay(contactPt, contactNormal * 0.12f, Color.yellow,          2f);
+        Debug.DrawRay(contactPt, l4SurfaceVel  * 0.04f, Color.white,           2f);
+        Debug.DrawRay(contactPt, pFwd          * 0.08f, new Color(1f, 0f, 1f), 2f);
+        Debug.Log($"[HIT-SOURCE] path=Layer4_Physics  " +
+                  $"contactPt={contactPt:F3}  normal={contactNormal:F3}  " +
+                  $"ballVelBefore={(_ballRb != null ? _ballRb.linearVelocity.ToString("F3") : "null")}  " +
+                  $"ballSpd={(_ballRb != null ? _ballRb.linearVelocity.magnitude : 0f):F3}m/s  " +
+                  $"paddleVel={_paddleVelocity.magnitude:F3}m/s  frame={Time.frameCount}");
+#endif
+        ApplyPaddleHit(contactPt, l4FaceNormal, l4BoxCenter);
+    }
+
+    // ── Face-normal snap ──────────────────────────────────────────────────────
+    //
+    // Called by both Layer_ComputePen and Layer4_Physics BEFORE ApplyPaddleHit.
+    //
+    // Problem: Physics.ComputePenetration returns the minimum-separation vector —
+    // the shortest path OUT of the overlapping volume.  On fast swings the ball
+    // can be partially inside the paddle's edge/corner, making the shortest exit
+    // direction sideways or downward rather than face-outward.  Even the physics
+    // solver's contact normal can deviate when ContinuousSpeculative registers a
+    // speculative contact on the rim.  Using these raw normals as the reflection
+    // axis sends the ball in the wrong direction and immediately triggers a table
+    // bounce sound.
+    //
+    // Fix: once the face-alignment gate (Abs(Dot(rawNormal, pFwd)) >= 0.5f) has
+    // confirmed the contact is on the rubber face region, snap the reflection axis
+    // to the exact canonical face normal.
+    //
+    //   pFwd = _paddleRb.rotation * Vector3.forward  (Rigidbody-authoritative)
+    //   Dot(rawNormal, pFwd) > 0  → ball came from front → use  +pFwd
+    //   Dot(rawNormal, pFwd) < 0  → ball came from back  → use  -pFwd
+    //
+    // The contact POINT is intentionally unchanged — it is still correct for
+    // leverArm and spin computation in ApplyPaddleHit.
+    //
+    private Vector3 SnapToPaddleFaceNormal(Vector3 rawNormal, Vector3 pFwd, string source)
+    {
+        float   dot        = Vector3.Dot(rawNormal, pFwd);
+        Vector3 faceNormal = dot >= 0f ? pFwd : -pFwd;
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+        Debug.Log($"[FACE-NORMAL-FIX] source={source}  " +
+                  $"rawNormal={rawNormal:F3}  usedNormal={faceNormal:F3}  " +
+                  $"faceAlign={Mathf.Abs(dot):F3}  approach={(dot >= 0f ? "front" : "back")}  " +
+                  $"frame={Time.frameCount}");
+#endif
+        return faceNormal;
     }
 
     // ── Paddle hit physics ────────────────────────────────────────────────────
     //
-    //  Physics reflection — matches Eleven Table Tennis feel:
+    //  contactPt     — physics contact point (from solver or ComputePenetration)
+    //  contactNormal — face-snapped outward normal (see SnapToPaddleFaceNormal).
+    //                  Always equals ±(_paddleRb.rotation * Vector3.forward).
+    //  paddleBoxCenter — world-space centre of paddle BoxCollider (from caller)
     //
-    //    1. Reflect the ball's incoming velocity off the paddle surface normal.
-    //       (Ball falling at 3 m/s, paddle stationary → ball leaves at 3 m/s upward.)
-    //    2. Add the paddle's velocity projected onto the normal, scaled by HIT_PAD_SCALE.
-    //       (Swinging the paddle hard → ball goes faster in that direction.)
-    //    3. Enforce a minimum outgoing speed (HIT_BASE_SPD) so even a dead-still
-    //       tap sends the ball somewhere playable.
-    //    4. Hard-cap total speed at HIT_MAX_SPD.
+    //  Physics reflection:
+    //    1. Reflect incoming ball velocity off contactNormal.
+    //    2. Blend toward paddle face motion direction at high swing speeds.
+    //    3. Speed = effectiveSurfaceSpeed * 1.8 + incomingSpeed * 0.2.
+    //    4. Clamp launch angle ≤ 50° above horizontal.
+    //    5. Spin from tangential brush velocity.
     //
-    //  Result: juggling feels natural (gentle taps = low arc, hard flicks = fast shots).
-    //
-    // closestSurfacePoint — nearest point on the paddle BoxCollider to the ball center,
-    // computed with ClosestPoint() before calling.  Used to derive a contact normal that
-    // is correct for ANY paddle rotation without relying on transform.up/forward/right.
-    void ApplyPaddleHit(Vector3 closestSurfacePoint)
+    void ApplyPaddleHit(Vector3 contactPt, Vector3 contactNormal, Vector3 paddleBoxCenter)
     {
-        // ── Contact normal ────────────────────────────────────────────────────
-        // Primary: vector from the closest surface point to the ball center.
-        // When tunneling has occurred, the ball is already past the paddle and
-        // ClosestPoint() returns the far face — diff then points the WRONG way
-        // (away from the player, toward opponent).  We detect this by checking
-        // if diff is pointing roughly the same direction the ball is moving, and
-        // if so we flip it.  This ensures the reflection is always physically
-        // correct regardless of which side of the paddle the ball ends up on.
-        Vector3 diff = _ballRb.position - closestSurfacePoint;
-        Vector3 contactNormal;
-        if (diff.sqrMagnitude > 1e-6f)
-        {
-            contactNormal = diff.normalized;
-            // If the ball is already moving in the same direction as the outward
-            // normal (i.e. ball passed through and is now on the far side), flip
-            // the normal so the reflection pushes the ball back the correct way.
-            Vector3 bv = _ballRb.linearVelocity;
-            if (bv.sqrMagnitude > 0.01f && Vector3.Dot(bv.normalized, contactNormal) > 0.7f)
-                contactNormal = -contactNormal;
-        }
-        else
-        {
-            // Ball center is exactly on the surface (or inside the box).
-            // Use the paddle face that the ball approached from — determined by
-            // which face normal most opposes the ball's incoming velocity.
-            Vector3 inVel = _ballRb.linearVelocity;
-            Vector3 pFwd  = paddle.transform.forward;
-            contactNormal = Vector3.Dot(inVel, pFwd) > 0f ? -pFwd : pFwd;
-        }
-        if (contactNormal == Vector3.zero) contactNormal = Vector3.up;
+        _diagApplyHitStart          = Time.realtimeSinceStartup;
+        _diagApplyHitCalledThisStep = true;
 
-        // ── Snap contact normal to nearest paddle face ────────────────────────
-        // Edge/corner contacts produce diagonal normals from ClosestPoint() that
-        // cause unpredictable reflections.  Projecting onto the three face axes
-        // and picking the dominant one gives a physically plausible result for
-        // all contact positions without relying on approximate threshold logic.
-        //
-        // IMPORTANT: use _paddleRb.rotation, NOT paddle.transform.right/up/forward.
-        // MoveRotation() updates _paddleRb.rotation immediately but the Transform is
-        // only synced AFTER the physics step completes.  Reading transform.forward
-        // here gives axes from the previous step — on a fast wrist flick that lag is
-        // 15–30° which is the exact cause of the systematic rightward drift at speed.
-        {
-            Vector3 pRight   = _paddleRb.rotation * Vector3.right;
-            Vector3 pUp      = _paddleRb.rotation * Vector3.up;
-            Vector3 pForward = _paddleRb.rotation * Vector3.forward;
-            float   dotR     = Mathf.Abs(Vector3.Dot(contactNormal, pRight));
-            float   dotU     = Mathf.Abs(Vector3.Dot(contactNormal, pUp));
-            float   dotF     = Mathf.Abs(Vector3.Dot(contactNormal, pForward));
-            Vector3 dominant = dotF >= dotR && dotF >= dotU ? pForward
-                             : dotU >= dotR                 ? pUp
-                             :                               pRight;
-            float   sign     = Mathf.Sign(Vector3.Dot(contactNormal, dominant));
-            if (sign == 0f) sign = 1f;
-            contactNormal = dominant * sign;
-        }
+        // Record for ANGULAR-SWEEP diagnostic
+        _diagLastRawNormal     = contactNormal;
+        _diagLastSnappedNormal = contactNormal;
+        _diagLastNormalFlipped = false;
+
+        // ── Reset rally bounce counter on each paddle hit ─────────────────────
+        // Bounce count since the last hit is logged in [PHYSICS-AUDIT] BEFORE the
+        // reset so the log reflects how many table contacts preceded this hit.
+        int hitBounceCount = _bounceCount;
+        _bounceCount = 0;
 
         Vector3 ballVel = _ballRb.linearVelocity;
-        // Note: no approach guard here — the if/else chain in FixedUpdate and the
-        // HIT_COOLDOWN gate prevent double-fires.  A guard based on relApproach would
-        // incorrectly reject tunneled-ball detections where the normal was already
-        // flipped above (the ball IS moving away, but that's the whole point — we
-        // need to reverse it).
+
+        // ── Effective contact-point velocity ──────────────────────────────────
+        // v_contact = v_linear + ω × leverArm
+        // Wrist rotation dominates topspin serves — angular contribution is
+        // essential for Eleven-like feel.  Lever arm from box centre to contact point.
+        Vector3 leverArm = contactPt - paddleBoxCenter;
+
+        // ── Low-speed angular damping ─────────────────────────────────────────
+        // At juggling speeds, XR tracking jitter in angular velocity injects
+        // unrealistic energy into effectiveVel.  Ramp the angular contribution
+        // smoothly to (1-lowSpeedAngularDamping) as linear speed approaches zero.
+        // Proxy: _paddleVelocity.magnitude (EMA-smoothed, already finite).
+        // lsBlend = 0 at zero speed → full damping; 1 at threshold → no damping.
+        float lsLinearSpd = _paddleVelocity.magnitude;
+        float lsBlend     = Mathf.SmoothStep(0f, 1f,
+                                lsLinearSpd / Mathf.Max(0.01f, lowSpeedAssistThreshold));
+        float effectiveAngularWeight = Mathf.Lerp(1f - lowSpeedAngularDamping, 1f, lsBlend);
+
+        Vector3 effectiveVel = _paddleVelocity
+                             + Vector3.Cross(_paddleAngularVelocity * effectiveAngularWeight, leverArm);
+        float   effectiveSpd = effectiveVel.magnitude;
 
         // Step 1 — reflect incoming ball velocity off the contact surface.
         float   normalIn  = Mathf.Max(0f, Vector3.Dot(ballVel, -contactNormal));
         Vector3 reflected = ballVel + 2f * normalIn * contactNormal;
 
         // Step 2 — compute outgoing DIRECTION.
-        //
-        // Problem with pure reflection: if the ball falls onto a horizontal paddle,
-        // reflected = straight up — the player's forward swing barely changes direction.
-        // Fix: blend the reflected direction toward the actual paddle SWING direction
-        // at higher swing speeds.  This makes "ball goes where you swing" rather than
-        // "ball bounces off the face".  At low swing speeds (gentle taps) the face
-        // normal still dominates, which is correct.
-        float   padSpd    = _paddleVelocity.magnitude;
-        Vector3 swingDir  = padSpd > 0.25f ? _paddleVelocity.normalized : contactNormal;
+        // Blend the reflected direction toward the effective surface velocity direction
+        // at higher swing speeds.  "Ball goes where the FACE moves" — correct for
+        // topspin brushes and wrist flicks where effectiveVel >> arm translation alone.
+        // At low speeds (gentle taps) the face normal still dominates.
+        Vector3 swingDir  = effectiveSpd > 0.25f ? effectiveVel.normalized : contactNormal;
+        // swingBlend cap raised 0.5→0.6 (calibration): paddle face direction contributes
+        // up to 60% at full swing speed, improving directional predictability.
+        float   swingBlend = Mathf.Clamp01((effectiveSpd - 0.25f) / 2.75f) * 0.6f;
+        Vector3 outDir    = Vector3.Slerp(reflected.normalized, swingDir, swingBlend).normalized;
 
-        // Blend 0→50% toward swing direction as speed goes from 0.25 → 3.0 m/s.
-        float   swingBlend   = Mathf.Clamp01((padSpd - 0.25f) / 2.75f) * 0.5f;
-        Vector3 outDir       = Vector3.Slerp(reflected.normalized, swingDir, swingBlend).normalized;
+        // ── Speed — effective surface speed is the primary driver ─────────────
+        // effectiveVel includes wrist rotation so a hard wrist flick now produces
+        // the same speed response as an arm drive.  Incoming ball speed contributes
+        // 20% — a genuine "loaded return" feel on fast incoming shots.
+        //   gentle wrist tap  effectiveSpd≈0.5 → ≈0.9 m/s ball
+        //   normal flick      effectiveSpd≈3.0 → ≈5.4 m/s ball
+        //   hard serve flick  effectiveSpd≈7.0 → ≈12.6 → capped to 12 m/s
+        // Calibration (raised from 1.8/0.20): EMA at 120 Hz attenuates fast wrist
+        // snaps (peak 6 m/s, 30 ms) down to ~2 m/s measured; 2.0× compensates so
+        // a real medium swing reliably clears the table.  0.25 incoming contribution
+        // gives a more responsive "loaded return" feel on fast shots.
+        float spd = effectiveSpd * 2.0f + normalIn * 0.25f;
 
-        // ── Speed — paddle-velocity dominant ─────────────────────────────────
-        // OLD additive formula (reflected.magnitude + padSpd * scale) had a fatal
-        // flaw: when the ball falls under gravity for 1-3 s, normalIn grows to
-        // 15-28 m/s → reflected.magnitude = 2×normalIn = 30-56 → always clamped
-        // to 12 regardless of swing intensity.  Every non-trivial hit sounded and
-        // felt identical.
-        //
-        // NEW formula: paddle speed is the primary driver; incoming ball speed
-        // contributes only 10% (adds natural "loaded return" feel without the cap
-        // domination).  Mapping:
-        //   gentle tap  padSpd=0.5 m/s → ≈1.0 m/s ball
-        //   normal swing padSpd=3.0 m/s → ≈5.4 m/s ball
-        //   hard swing  padSpd=7.0 m/s → ≈12.6 → capped to 12 m/s
-        float spd = padSpd * 1.8f + normalIn * 0.10f;
-
-        // Step 3 — clamp upward launch angle to ≤ 35° above horizontal.
+        // Step 3 — clamp upward launch angle to ≤ 50° above horizontal.
         // Use a normalized directional clamp (not a raw Y chop) so the direction
-        // vector stays valid.  sin(35°) ≈ 0.574.
+        // vector stays valid.  sin(50°) ≈ 0.766.
+        // 50° allows steep topspin trajectories (vs old 35° which was too aggressive).
         // This replaces the old "if (finalVel.y > 3.0f) finalVel.y = 3.0f" which
         // silently broke the direction on fast upward shots.
-        const float MAX_Y_FRACTION = 0.574f;  // sin(35°)
+        const float MAX_Y_FRACTION = 0.766f;  // sin(50°)
         if (outDir.y > MAX_Y_FRACTION)
         {
             outDir.y = MAX_Y_FRACTION;
@@ -920,28 +1657,173 @@ public class gameplay : MonoBehaviour
             }
         }
 
-        // Soften speed slightly when contact normal is mostly upward (gentle tap).
-        float verticalBias = Mathf.Clamp01(Vector3.Dot(contactNormal, Vector3.up));
-        spd = Mathf.Lerp(spd, spd * 0.65f, verticalBias);
+        // ── Forward-bias — prevent sideways launches off the table ────────────
+        // Decompose outDir into: forward (toward opponent), vertical, lateral.
+        // Rules applied in order:
+        //   1. Forward component floored at MIN_FWD — prevents backward/neutral hits.
+        //   2. Lateral capped at forward × MAX_LAT_RATIO — max ~45° off table axis.
+        // _tableForward = horizontal unit vector playerside→enemyside (cached in Start).
+        // Guard: only applies when _tableForward is initialised (sqrMag > 0.5).
+        if (_tableForward.sqrMagnitude > 0.5f)
+        {
+            float   fwdDot = Vector3.Dot(outDir, _tableForward);
+            float   yComp  = outDir.y;
+            // Lateral = outDir minus its forward and vertical parts.
+            // _tableForward is horizontal, so forward/up/lateral are orthogonal.
+            Vector3 latVec = outDir - fwdDot * _tableForward - yComp * Vector3.up;
+            float   latMag = latVec.magnitude;
 
-        // Adaptive minimum speed.
-        float minSpd = padSpd >= 0.8f ? 1.2f : padSpd * 1.5f;
+            const float MIN_FWD       = 0.20f;   // floor: ensures ball always travels toward opponent
+            const float MAX_LAT_RATIO = 1.00f;   // cap: |lateral| ≤ |forward| → ≤ 45° off-axis
+
+            float clampedFwd = Mathf.Max(fwdDot, MIN_FWD);
+            float maxLat     = clampedFwd * MAX_LAT_RATIO;
+            if (latMag > maxLat && latMag > 1e-5f)
+                latVec = latVec * (maxLat / latMag);
+
+            // Rebuild and renormalize. Y is unchanged (already bounded by 50° clamp).
+            outDir = (clampedFwd * _tableForward + yComp * Vector3.up + latVec).normalized;
+        }
+
+        // Upward-normal softening removed: the verticalBias Lerp previously
+        // attenuated speed whenever the contact normal had a large Y component,
+        // which occurs during topspin serves (closed face, angled upward-forward).
+        // This penalised exactly the contacts we most want to feel responsive.
+        //
+        // Adaptive minimum speed — calibration pass:
+        //   effectiveSpd ≥ 1.0 m/s → floor 3.0 m/s (any real swing clears the net)
+        //   effectiveSpd ≥ 0.5 m/s → floor 1.5 m/s (gentle tap zone)
+        //   below 0.5            → scale with speed (juggling / resting contact)
+        // Original line: float minSpd = effectiveSpd >= 0.8f ? 1.2f : effectiveSpd * 1.5f;
+        float minSpd = effectiveSpd >= 1.0f ? 3.0f
+                     : effectiveSpd >= 0.5f ? 1.5f
+                     : effectiveSpd * 1.5f;
         spd = Mathf.Clamp(spd, minSpd, HIT_MAX_SPD);
 
-        _ballRb.linearVelocity = outDir * spd;
+        // ── [HIT-DIR] — ungated, fires in release APK builds via adb logcat ───
+        // Logs the final outgoing direction AFTER all clamps so forwardDot/lateral
+        // reflect exactly what the ball receives.
+        {
+            float hitFwdDot  = _tableForward.sqrMagnitude > 0.5f
+                             ? Vector3.Dot(outDir, _tableForward) : 0f;
+            float hitLateral = _tableForward.sqrMagnitude > 0.5f
+                             ? (outDir - hitFwdDot * _tableForward - outDir.y * Vector3.up).magnitude
+                             : 0f;
+            Debug.Log($"[HIT-DIR] outDir={outDir:F3}  tableForward={_tableForward:F3}" +
+                      $"  forwardDot={hitFwdDot:F3}  lateral={hitLateral:F3}" +
+                      $"  speed={spd:F2}  source={_diagLayer}");
+        }
 
-        // Push ball clear of the paddle face so the physics solver has no
-        // residual penetration to correct on the next step.  Without this,
-        // ContinuousSpeculative can generate a separation impulse that fights
-        // our velocity assignment, producing the "sticky paddle" feel.
-        // Move to contact point + 2.5 cm along the contact normal (ball radius
-        // is ~2 cm, so this guarantees no overlap even after position correction).
-        _ballRb.position = closestSurfacePoint + contactNormal * 0.025f;
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+        // ── HIT-DIAG block ───────────────────────────────────────────────────
+        {
+            float diagBallSpd   = _ballRb.linearVelocity.magnitude;
+            bool  diagHighSpeed = diagBallSpd > 6f || effectiveSpd > 5f;
+            bool  diagBackhand  = Vector3.Dot(_paddleRb.rotation * Vector3.forward, Vector3.forward) < 0f;
+            float diagRotDiff   = Quaternion.Angle(_paddleRb.rotation, paddle.transform.rotation);
+            float diagPenDepth  = 0f;
+            Vector3 diagPenDir  = Vector3.zero;
+            bool    diagPenHit  = false;
+            if (_ballCollider != null && paddleBox != null)
+            {
+                try
+                {
+                    diagPenHit = Physics.ComputePenetration(
+                        _ballCollider, _ballRb.position, Quaternion.identity,
+                        paddleBox, paddleBox.transform.position, paddleBox.transform.rotation,
+                        out diagPenDir, out diagPenDepth);
+                }
+                catch { }
+            }
+            string tag = diagHighSpeed ? "[HIT-DIAG][HIGH-SPEED]" : "[HIT-DIAG]";
+            Debug.Log($"{tag} layer={_diagLayer}  frame={Time.frameCount}  fixedTime={Time.fixedTime:F4}" +
+                      $"\n  ball  pos={_ballRb.position:F4}  vel={_ballRb.linearVelocity:F4} ({diagBallSpd:F3})  angVel={_ballRb.angularVelocity:F3}" +
+                      $"\n  paddle  rbPos={_paddleRb.position:F4}  rbRot={_paddleRb.rotation.eulerAngles:F2}  rbTrRot={diagRotDiff:F2}°" +
+                      $"\n  surfVel={effectiveVel:F4} ({effectiveSpd:F3})  linVel={_paddleVelocity:F4}  angVel={_paddleAngularVelocity:F4}" +
+                      $"\n  contact  pt={contactPt:F4}  normal={contactNormal:F4}" +
+                      $"\n  out  dir={outDir:F4}  spd={spd:F3}  vel={outDir * spd:F4}" +
+                      $"\n  pen  hit={diagPenHit}  depth={diagPenDepth:F5}" +
+                      $"\n  backhand={diagBackhand}  separated={_ballSeparated}");
+        }
+        // ── END HIT-DIAG ─────────────────────────────────────────────────────
+#endif
+
+        _ballRb.linearVelocity = outDir * spd;
+        _diagLastAssignedVel   = outDir * spd;
+        _diagLastFinalBallVel  = outDir * spd;
+
+        // ── Ball repositioning — face-based placement ─────────────────────────
+        // Compute the target position into a local variable FIRST, then assign
+        // to _ballRb.position.  The diagnostic must use the same local variable —
+        // NOT _ballRb.position — because Unity's physics system queues Rigidbody
+        // position writes during FixedUpdate: a read of _ballRb.position after the
+        // write returns the OLD value (still inside the paddle) until the next
+        // physics step processes the queue.  Reading _ballRb.position for
+        // ComputePenetration was the root cause of the "still penetrating" false
+        // positives even after repositioning was geometrically correct.
+        //
+        // Face-based formula:
+        //   contactNormal is snapped to a face axis, so its inverse-rotation into
+        //   local space is exactly ±(1,0,0), ±(0,1,0), or ±(0,0,±1).
+        //   halfExtInFace = dot(scaledHalfExtents, abs(localNormal)) selects the
+        //   correct box half-dimension for that face.
+        //   faceCentre = paddleBoxCenter + contactNormal * halfExtInFace.
+        //   Ball centre placed at faceCentre + contactNormal * BALL_CLEARANCE —
+        //   always outside the paddle regardless of penetration depth.
+        Vector3 repoBallPos;
+        {
+            // Use paddleBox.transform.rotation (not _paddleRb.rotation) so the local-space
+            // conversion is correct when paddleBox is on a child with its own orientation.
+            Vector3 localNormal = Quaternion.Inverse(paddleBox.transform.rotation) * contactNormal;
+            Vector3 scaledHalf  = Vector3.Scale(
+                paddleBox.size * 0.5f,
+                new Vector3(
+                    Mathf.Abs(paddleBox.transform.lossyScale.x),
+                    Mathf.Abs(paddleBox.transform.lossyScale.y),
+                    Mathf.Abs(paddleBox.transform.lossyScale.z)));
+            float halfExtInFace = Mathf.Abs(localNormal.x) * scaledHalf.x
+                                + Mathf.Abs(localNormal.y) * scaledHalf.y
+                                + Mathf.Abs(localNormal.z) * scaledHalf.z;
+            // Face centre in world space (paddleBoxCenter already includes paddleBox.center offset).
+            // Ball centre = face surface + measured ball world radius (≈2.49 cm) + 1 mm margin.
+            // BALL_CLEARANCE 0.027 confirmed against ball SphereCollider world radius ≈0.02486 m
+            // (solid radius=0.5 × scale=0.04972, or similar) — previous 0.023 left 1.86 mm residual.
+            const float BALL_CLEARANCE = 0.027f;
+            repoBallPos = paddleBoxCenter + contactNormal * (halfExtInFace + BALL_CLEARANCE);
+        }
+        _ballRb.position = repoBallPos;
+
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+        // Confirm no residual penetration after repositioning (dev builds only).
+        if (_ballCollider != null && paddleBox != null)
+        {
+            try
+            {
+                bool postPen = Physics.ComputePenetration(
+                    _ballCollider, repoBallPos,                  Quaternion.identity,
+                    paddleBox,     paddleBox.transform.position, paddleBox.transform.rotation,
+                    out Vector3 postDir, out float postDepth);
+                if (postPen)
+                    Debug.Log($"[HIT-DIAG] POST-REPOSITION still penetrating depth={postDepth:F5}  dir={postDir:F4}");
+            }
+            catch { }
+        }
+
+        // ── Debug visualization (Editor Scene view via Link/Air Link) ─────────
+        {
+            Vector3 finalVel = outDir * spd;
+            Debug.DrawRay(contactPt, contactNormal * 0.13f, Color.yellow,          2f);
+            Debug.DrawRay(contactPt, ballVel       * 0.04f, Color.cyan,            2f);
+            Debug.DrawRay(contactPt, finalVel      * 0.04f, Color.green,           2f);
+            Debug.DrawRay(contactPt, effectiveVel  * 0.04f, Color.white,           2f);
+            Debug.DrawLine(contactPt, repoBallPos,           new Color(1f,0.4f,0f), 2f);
+        }
+#endif
 
         // Step 4 — spin from tangential (brushing) paddle-surface velocity.
-        // Decompose paddle velocity into:
-        //   normal component  = push-through the face (no spin contribution)
-        //   tangential component = brushing motion → generates spin
+        // Use effectiveVel (linear + angular contribution) so wrist brushes
+        // generate realistic topspin/backspin even without arm translation.
+        // Decompose into normal (push-through, no spin) and tangential (brushing → spin).
         // Cross(normal, tangential) gives the correct axis:
         //   upward brush on upward-facing normal → topspin ✓
         //   downward brush                        → backspin ✓
@@ -950,11 +1832,85 @@ public class gameplay : MonoBehaviour
         // Clamp to MAX_SPIN to prevent physics instability during long sessions —
         // without a cap, repeated hits can push angularVelocity into values that
         // destabilise the physics solver and cause erratic bounces.
-        Vector3 nComp      = Vector3.Dot(_paddleVelocity, contactNormal) * contactNormal;
-        Vector3 tangential = _paddleVelocity - nComp;
-        Vector3 spinDelta  = Vector3.Cross(contactNormal, tangential) * SPIN_COEFF;
+
+        // ── Micro-jitter stabilization (spin normal only) ─────────────────────
+        // At low speed, mm-level contact-point noise produces slightly different
+        // contact normals each hit, causing spin variation.  Blend the normal used
+        // for spin decomposition toward the true paddle face normal.
+        // outDir is NOT changed — no aim assist, no shot-direction change.
+        //
+        // Use _paddleRb.rotation (Rigidbody-authoritative) — the same source used by
+        // SnapToPaddleFaceNormal that produced contactNormal.  paddle.transform.forward
+        // can lag by one physics step during fast wrist transitions (forehand→backhand),
+        // causing a mismatch exactly when a hit fires.  Choose the sign that agrees
+        // with contactNormal so both faces are handled symmetrically without a separate
+        // flip-guard branch.
+        Vector3 rbFwdForSpin = _paddleRb.rotation * Vector3.forward;
+        Vector3 paddleFwd    = Vector3.Dot(rbFwdForSpin, contactNormal) >= 0f
+                             ? rbFwdForSpin : -rbFwdForSpin;
+        float stabFactor  = (1f - lsBlend) * juggleStabilityStrength;
+        Vector3 spinNormal = Vector3.Slerp(contactNormal, paddleFwd, stabFactor).normalized;
+
+        Vector3 nComp      = Vector3.Dot(effectiveVel, spinNormal) * spinNormal;
+        Vector3 tangential = effectiveVel - nComp;
+
+        // ── Low-speed spin damping ────────────────────────────────────────────
+        // Progressively reduce spin generation for soft contacts.
+        // Uses effectiveSpd (post-angular-damping) — same energy proxy as the
+        // angular ramp, so assists activate and deactivate in lock-step.
+        float spinBlend = Mathf.SmoothStep(0f, 1f,
+                              effectiveSpd / Mathf.Max(0.01f, lowSpeedAssistThreshold));
+        float spinScale = Mathf.Lerp(1f - lowSpeedSpinDamping, 1f, spinBlend);
+
+        Vector3 spinDelta  = Vector3.Cross(spinNormal, tangential) * SPIN_COEFF * spinScale;
         _ballRb.angularVelocity = Vector3.ClampMagnitude(
             _ballRb.angularVelocity * 0.3f + spinDelta, MAX_SPIN);
+
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+        // ── [SPIN-DIAG] — emitted on every validated hit in dev builds ──────────
+        // Compare forehand vs backhand lines to diagnose spin asymmetry:
+        //   • faceSide          which rubber/wood face was active
+        //   • paddleForward/Right/Up  full Rigidbody-authoritative frame for this hit
+        //   • contactNormal     face-snapped normal (always ± rbFwd toward ball)
+        //   • spinNormal        stabilized normal used for cross-product decomposition
+        //   • effectiveVel      linear + angular contribution at contact point
+        //   • tangential        brushing component (drives spin magnitude and axis)
+        //   • spinDelta         raw spin vector before clamp (rad/s)
+        //   • finalAngVel       angular velocity written to ball Rigidbody
+        // If tangential.magnitude is small for backhand → swing is mostly along
+        // spinNormal (forward push) with little brushing → increase wrist snap.
+        // If faceSide=back when you expect front → SnapToPaddleFaceNormal flipped.
+        {
+            bool    faceFront = Vector3.Dot(contactNormal, _paddleRb.rotation * Vector3.forward) >= 0f;
+            string  faceSide  = faceFront ? "front" : "back";
+            Vector3 rbRight   = _paddleRb.rotation * Vector3.right;
+            Vector3 rbUp      = _paddleRb.rotation * Vector3.up;
+            Debug.Log($"[SPIN-DIAG] source={_diagLayer}  faceSide={faceSide}  frame={Time.frameCount}" +
+                      $"\n  paddleForward={rbFwdForSpin:F3}  paddleRight={rbRight:F3}  paddleUp={rbUp:F3}" +
+                      $"\n  contactNormal={contactNormal:F3}  spinNormal={spinNormal:F3}" +
+                      $"\n  effectiveVel={effectiveVel:F3} ({effectiveSpd:F3} m/s)" +
+                      $"\n  tangential={tangential:F3} ({tangential.magnitude:F3} m/s)" +
+                      $"\n  spinDelta={spinDelta:F3} ({spinDelta.magnitude:F3} rad/s)" +
+                      $"\n  finalAngVel={_ballRb.angularVelocity:F3} ({_ballRb.angularVelocity.magnitude:F3} rad/s)");
+        }
+#endif
+
+        // ── Hit telemetry event ────────────────────────────────────────────────
+        // Fires on every validated hit after all physics writes are complete.
+        // outSpin reflects the value actually written to _ballRb.angularVelocity.
+        // Consumed by RealHitVarianceLogger; safe to leave unsubscribed.
+        OnHitTelemetry?.Invoke(new HitTelemetryData
+        {
+            hitSource            = _diagLayer,
+            contactPoint         = contactPt,
+            contactNormal        = contactNormal,
+            leverArmMag          = leverArm.magnitude,
+            paddleLinearVelocity = _paddleVelocity,
+            paddleAngVelocity    = _paddleAngularVelocity,
+            effectiveSpd         = effectiveSpd,
+            outSpeed             = spd,
+            outSpin              = _ballRb.angularVelocity.magnitude
+        });
 
         _ballRb.useGravity = true;
         _ballSeparated     = false;  // lock out further hits until ball exits paddle zone
@@ -966,6 +1922,12 @@ public class gameplay : MonoBehaviour
         _lastHitFrame         = Time.frameCount;
         playerPaddleCollision = 1;
 
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+        float diagApplyMs = (Time.realtimeSinceStartup - _diagApplyHitStart) * 1000f;
+        if (diagApplyMs > 2f)
+            Debug.Log($"[PADDLE-FREEZE][TIMING] ApplyPaddleHit took {diagApplyMs:F3} ms (threshold 2 ms)");
+#endif
+
         PlayPaddleHitSound(spd);
 
         // PaddleTiltDeg: raw angle from vertical (0°=flat, 90°=vertical spin stance).
@@ -973,8 +1935,15 @@ public class gameplay : MonoBehaviour
 
         // PaddleAngleErrorDeg: deviation from ideal topspin normal.
         // IDEAL_SPIN_NORMAL = Vector3(0, 0.707, 0.707) — 45° closed toward opponent.
-        // 0° = perfect topspin orientation. 90° = flat hit. 180° = opposite face.
-        float paddleAngleErrorDeg = Vector3.Angle(contactNormal, IDEAL_SPIN_NORMAL);
+        // 0° = perfect topspin orientation. 90° = flat hit.
+        //
+        // Use the nearer ideal face so backhand contacts (where contactNormal may
+        // point away from the forehand ideal) are measured against the correct
+        // reference and never receive an artificially inflated angle error in the
+        // research data.  This keeps the metric meaningful for both hit faces.
+        Vector3 idealForFace       = Vector3.Dot(contactNormal, IDEAL_SPIN_NORMAL) >= 0f
+                                   ? IDEAL_SPIN_NORMAL : -IDEAL_SPIN_NORMAL;
+        float paddleAngleErrorDeg  = Vector3.Angle(contactNormal, idealForFace);
 
         // MinPaddleTableDistM: closest the paddle came to the table this serve.
         // Cap at 9.999 if never within measurable range (player never approached table).
@@ -983,12 +1952,80 @@ public class gameplay : MonoBehaviour
 
         ExperimentLogger.Instance?.LogPlayerHit(
             spd, tangential.magnitude,
+            _ballRb.angularVelocity.magnitude,
             paddleAngleErrorDeg, paddleTiltDeg,
             minDist);
 
-        Debug.Log($"[gameplay] HIT spd={spd:F1} spin={_ballRb.angularVelocity.magnitude:F0} " +
+        // ── Haptic event — fires after every validated paddle hit ─────────────
+        OnValidPaddleHit?.Invoke(effectiveSpd, _ballRb.angularVelocity.magnitude);
+
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+        Debug.Log($"[gameplay] HIT spd={spd:F1} effVel={effectiveSpd:F1} linVel={_paddleVelocity.magnitude:F1} " +
+                  $"spin={_ballRb.angularVelocity.magnitude:F0} " +
                   $"tilt={paddleTiltDeg:F1}° angleErr={paddleAngleErrorDeg:F1}° " +
                   $"minTableDist={minDist:F3}m");
+
+        // ── HIT-CAL: per-hit calibration log ──────────────────────────────────
+        // Records the full energy breakdown for every hit.
+        // Use this to quantify whether angular velocity is genuinely responsible
+        // for excess energy on low-speed and edge contacts.
+        // Format is one compact line to keep the log scannable.
+        {
+            float calLinear   = _paddleVelocity.magnitude;
+            float calAngular  = _paddleAngularVelocity.magnitude;
+            float calAngContrib = Vector3.Cross(
+                _paddleAngularVelocity * effectiveAngularWeight, leverArm).magnitude;
+            float calLeverArm = leverArm.magnitude;
+            float calSpin     = _ballRb.angularVelocity.magnitude;
+            Vector3 calContactLocal = paddleBox != null
+                ? paddleBox.transform.InverseTransformPoint(contactPt)
+                : contactPt;
+            Debug.Log(
+                $"[HIT-CAL] " +
+                $"linear={calLinear:F3} " +
+                $"angular={calAngular:F3} " +
+                $"angContrib={calAngContrib:F3} " +
+                $"effectiveSpd={effectiveSpd:F3} " +
+                $"leverArm={calLeverArm:F4} " +
+                $"outSpeed={spd:F3} " +
+                $"spin={calSpin:F1} " +
+                $"contact=({calContactLocal.x:F3},{calContactLocal.y:F3},{calContactLocal.z:F3}) " +
+                $"normal=({contactNormal.x:F3},{contactNormal.y:F3},{contactNormal.z:F3}) " +
+                $"lsBlend={lsBlend:F3} " +
+                $"angWeight={effectiveAngularWeight:F3}");
+        }
+
+        // ── [PHYSICS-AUDIT] — structured per-hit calibration log ─────────────
+        // Fires on every validated paddle hit (dev/editor builds).
+        // Use these fields to audit realism, consistency, and energy transfer:
+        //   PaddleVelocity  — EMA-smoothed world-space linear velocity (m/s).
+        //                     If consistently low (<1.5) despite hard swings,
+        //                     raise velEmaAlpha in the Inspector (default 0.35→0.5).
+        //   PaddleForward   — Rigidbody-authoritative face direction at contact.
+        //   ContactPoint    — World-space contact point (local coords in HIT-CAL).
+        //   OutgoingVelocity— Final velocity written to the ball Rigidbody (m/s).
+        //   OutgoingSpeed   — |OutgoingVelocity| (m/s). Should be ≥ 3 m/s for
+        //                     any intentional swing (effectiveSpd ≥ 1.0 m/s).
+        //   GeneratedSpin   — |angularVelocity| after hit (rad/s).
+        //                     Topspin/backspin ~80–200 rad/s is realistic.
+        //   BounceCount     — Table contacts since the PREVIOUS paddle hit.
+        //                     High values (>4) indicate long rally with energy decay.
+        {
+            Vector3 auditPaddleFwd  = _paddleRb.rotation * Vector3.forward;
+            Vector3 auditOutVel     = _ballRb.linearVelocity;   // already written above
+            float   auditOutSpd     = auditOutVel.magnitude;
+            float   auditSpin       = _ballRb.angularVelocity.magnitude;
+            Debug.Log(
+                $"[PHYSICS-AUDIT] frame={Time.frameCount}  layer={_diagLayer}\n" +
+                $"  PaddleVelocity={_paddleVelocity:F3} ({_paddleVelocity.magnitude:F2} m/s)\n" +
+                $"  PaddleForward={auditPaddleFwd:F3}\n" +
+                $"  ContactPoint={contactPt:F3}\n" +
+                $"  OutgoingVelocity={auditOutVel:F3}\n" +
+                $"  OutgoingSpeed={auditOutSpd:F2} m/s\n" +
+                $"  GeneratedSpin={auditSpin:F1} rad/s\n" +
+                $"  BounceCount={hitBounceCount}");
+        }
+#endif
     }
 
     // Sharp percussive click matching real table tennis paddle contact.
@@ -996,33 +2033,49 @@ public class gameplay : MonoBehaviour
     // gives the "click" character rather than a sustained ping.
     static AudioClip CreatePaddleClickClip()
     {
-        const int   sampleRate = 44100;
-        const float duration   = 0.040f;   // 40ms — short percussive attack
-        int     samples = Mathf.RoundToInt(sampleRate * duration);
-        float[] data    = new float[samples];
+        const int sampleRate = 44100;
+        const float duration = 0.090f;   // 90ms: louder/easier to hear on Quest speakers
+
+        int samples = Mathf.RoundToInt(sampleRate * duration);
+        float[] data = new float[samples];
+
         for (int i = 0; i < samples; i++)
         {
-            float t   = (float)i / sampleRate;
-            float env = Mathf.Exp(-t * 90f);   // very fast decay → click, not ping
-            float sig = 0.65f * Mathf.Sin(2f * Mathf.PI * 2400f * t)
-                      + 0.25f * Mathf.Sin(2f * Mathf.PI * 4200f * t)
-                      + 0.10f * Mathf.Sin(2f * Mathf.PI * 6800f * t);
-            data[i] = env * sig;
+            float t = (float)i / sampleRate;
+            float env = Mathf.Exp(-t * 45f);
+
+            float sig =
+                0.55f * Mathf.Sin(2f * Mathf.PI * 1800f * t) +
+                0.30f * Mathf.Sin(2f * Mathf.PI * 3200f * t) +
+                0.15f * Mathf.Sin(2f * Mathf.PI * 5200f * t);
+
+            data[i] = Mathf.Clamp(env * sig * 1.8f, -1f, 1f);
         }
-        var clip = AudioClip.Create("PaddleClick", samples, 1, sampleRate, false);
+
+        AudioClip clip = AudioClip.Create("PaddleClick_LOUD", samples, 1, sampleRate, false);
         clip.SetData(data, 0);
         return clip;
     }
 
     void PlayPaddleHitSound(float speed)
     {
-        if (_paddleAudio == null || _paddleHitClip == null) return;
-        // Pitch rises slightly with speed — faster shots sound crisper.
-        _paddleAudio.pitch = Mathf.Clamp(0.9f + speed * 0.04f, 0.85f, 1.5f);
-        // PlayOneShot allows overlapping audio during fast juggling sequences.
-        // Play() would cut the previous click short on every consecutive hit.
-        _paddleAudio.PlayOneShot(_paddleHitClip,
-            Mathf.Clamp(0.65f + speed * 0.03f, 0.65f, 1.0f));
+        Debug.Log($"[SOUND-DIAG] PlayPaddleHitSound called speed={speed:F3} audioNull={_gameplayAudio == null} clipNull={_paddleHitClip == null}");
+
+        if (_gameplayAudio == null || _paddleHitClip == null)
+            return;
+
+        // AUDIO-ONLY PATCH: force reliable 2D playback. Do not touch physics.
+        _gameplayAudio.enabled = true;
+        _gameplayAudio.mute = false;
+        _gameplayAudio.spatialBlend = 0f;
+        _gameplayAudio.volume = 1f;
+        _gameplayAudio.priority = 0;
+        _gameplayAudio.outputAudioMixerGroup = null;
+
+        _gameplayAudio.pitch = Mathf.Clamp(0.95f + speed * 0.03f, 0.9f, 1.25f);
+        _gameplayAudio.PlayOneShot(_paddleHitClip, 1f);
+
+        Debug.Log($"[SOUND-DIAG] PlayOneShot executed FULL VOLUME clip={_paddleHitClip.name} pitch={_gameplayAudio.pitch:F3} frame={Time.frameCount}");
     }
 
     // ── Serve system ──────────────────────────────────────────────────────────
@@ -1051,6 +2104,15 @@ public class gameplay : MonoBehaviour
         Vector3 ballInHand = _leftPos + palmOffset;
         bool    triggerHeld = GetLeftTriggerHeld();
 
+        // ── Trigger-held diagnostic (once per second) ─────────────────────────
+        if (triggerHeld && Time.time > _serveDiagLastLog + 1f)
+        {
+            _serveDiagLastLog = Time.time;
+            Vector3 ballPos = (ball != null) ? ball.transform.position : Vector3.one * -999f;
+            Debug.Log($"[SERVE-DIAG] state={ballbounce.state} phase={_servePhase} " +
+                      $"leftValid={_leftValid} triggerHeld={triggerHeld} " +
+                      $"ballPos=({ballPos.x:F2},{ballPos.y:F2},{ballPos.z:F2})");
+        }
 
         // ── World-escape fallback ─────────────────────────────────────────────
         // If the ball has fallen off the scene geometry (through a gap between
@@ -1141,8 +2203,10 @@ public class gameplay : MonoBehaviour
 
         if (_ballRb == null || ball == null) return;
 
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
         if (_debugFrame % 60 == 0)
             Debug.Log($"[SERVE] phase={_servePhase} held={triggerHeld} leftValid={_leftValid}");
+#endif
 
         // ── Timeout reset: ball stuck on floor after a weak toss ─────────
         // Only fires when the ball is in a scoring/reset state (playerStart or
@@ -1181,10 +2245,15 @@ public class gameplay : MonoBehaviour
             // A kinematic Rigidbody teleports exactly to wherever _ballRb.position
             // is written — the solver never pushes it.  isKinematic switches back to
             // false at toss so physics takes over cleanly.
+            // Zero velocity BEFORE setting kinematic — Unity 6 rejects velocity
+            // writes on kinematic bodies with a hard warning.
+            if (!_ballRb.isKinematic)
+            {
+                _ballRb.linearVelocity  = Vector3.zero;
+                _ballRb.angularVelocity = Vector3.zero;
+            }
             _ballRb.isKinematic     = true;
             _ballRb.useGravity      = false;
-            _ballRb.linearVelocity  = Vector3.zero;   // cleared so toss starts from zero
-            _ballRb.angularVelocity = Vector3.zero;
             _ballRb.position        = ballInHand;
             _prevBallPosValid       = false;   // invalidate sweep until ball is live
             SetBallVisible(true);
@@ -1222,10 +2291,8 @@ public class gameplay : MonoBehaviour
 
                 // Pin ball to palm each frame via kinematic teleport.
                 // Ball is kinematic during Held — no depenetration forces, no solver
-                // fights.  Velocity writes are no-ops on kinematic bodies but kept
-                // here so the stored state is clean at the moment isKinematic→false.
-                _ballRb.linearVelocity  = Vector3.zero;
-                _ballRb.angularVelocity = Vector3.zero;
+                // fights.  Do NOT write velocity while kinematic: Unity 6 rejects
+                // those writes with a hard warning every frame.
                 _ballRb.useGravity      = false;
                 _ballRb.position        = ballInHand;
             }
@@ -1238,6 +2305,96 @@ public class gameplay : MonoBehaviour
                 Vector3 tossVel = _leftHandVelocity;
                 if (tossVel.y < 1.0f) tossVel.y = 1.0f;   // always rise at least 1 m/s
 
+                // ── RELEASE DIAGNOSTIC ───────────────────────────────────────
+                // Purpose: confirm whether the ball overlaps scene geometry at
+                // the exact frame isKinematic flips true→false.
+                // Read these logs via ADB logcat tag "Unity" after a toss.
+                {
+                    const float BALL_R = 0.02f;   // matches ballbounce.BALL_RADIUS
+
+                    Debug.Log($"[TOSS-DIAG] ── release frame ──────────────────────────");
+                    Debug.Log($"[TOSS-DIAG] ballInHand world pos = {ballInHand:F4}");
+                    Debug.Log($"[TOSS-DIAG] tossVel assigned     = {tossVel:F4}  (magnitude={tossVel.magnitude:F3})");
+
+                    // ── Named suspects ──────────────────────────────────────
+                    string[] suspectNames = { "playerside", "net", "Net", "TableNet", "table_net" };
+                    foreach (string sn in suspectNames)
+                    {
+                        GameObject sgo = GameObject.Find(sn);
+                        if (sgo == null) continue;
+                        Collider sc = sgo.GetComponent<Collider>();
+                        if (sc == null) continue;
+                        Debug.Log($"[TOSS-DIAG] suspect '{sn}' bounds={sc.bounds}  layer={sgo.layer}  isTrigger={sc.isTrigger}");
+                        if (_ballCollider != null)
+                        {
+                            try
+                            {
+                                bool pen = Physics.ComputePenetration(
+                                    _ballCollider, ballInHand, Quaternion.identity,
+                                    sc, sc.transform.position, sc.transform.rotation,
+                                    out Vector3 penDir, out float penDist);
+                                Debug.Log($"[TOSS-DIAG]   ComputePenetration → overlap={pen}  depth={penDist:F5} m  pushDir={penDir:F3}");
+                            }
+                            catch (System.Exception ex)
+                            {
+                                Debug.Log($"[TOSS-DIAG]   ComputePenetration threw: {ex.Message}");
+                            }
+                        }
+                    }
+
+                    // ── Paddle ───────────────────────────────────────────────
+                    if (paddleBox != null)
+                    {
+                        Debug.Log($"[TOSS-DIAG] paddle bounds={paddleBox.bounds}  layer={paddle?.gameObject.layer}");
+                        if (_ballCollider != null)
+                        {
+                            try
+                            {
+                                bool pen = Physics.ComputePenetration(
+                                    _ballCollider, ballInHand, Quaternion.identity,
+                                    paddleBox, paddleBox.transform.position, paddleBox.transform.rotation,
+                                    out Vector3 penDir, out float penDist);
+                                Debug.Log($"[TOSS-DIAG]   ComputePenetration → overlap={pen}  depth={penDist:F5} m  pushDir={penDir:F3}");
+                            }
+                            catch (System.Exception ex)
+                            {
+                                Debug.Log($"[TOSS-DIAG]   ComputePenetration threw: {ex.Message}");
+                            }
+                        }
+                    }
+
+                    // ── OverlapSphere sweep: any solid geometry within BALL_R + 1 cm ──
+                    // Query BEFORE isKinematic flips so the ball's own collider is
+                    // still kinematic and excluded from physics — only external
+                    // colliders appear in the result.
+                    Collider[] releaseOverlaps = Physics.OverlapSphere(
+                        ballInHand, BALL_R + 0.01f, ~0, QueryTriggerInteraction.Ignore);
+                    Debug.Log($"[TOSS-DIAG] OverlapSphere r={BALL_R + 0.01f:F3} — {releaseOverlaps.Length} solid collider(s) found");
+                    foreach (Collider oc in releaseOverlaps)
+                    {
+                        Debug.Log($"[TOSS-DIAG]   collider='{oc.name}' go='{oc.gameObject.name}' layer={oc.gameObject.layer}  bounds={oc.bounds}");
+                        if (_ballCollider != null)
+                        {
+                            try
+                            {
+                                bool pen = Physics.ComputePenetration(
+                                    _ballCollider, ballInHand, Quaternion.identity,
+                                    oc, oc.transform.position, oc.transform.rotation,
+                                    out Vector3 penDir, out float penDist);
+                                if (pen)
+                                    Debug.Log($"[TOSS-DIAG]     PENETRATING  depth={penDist:F5} m  pushDir={penDir:F3}");
+                                else
+                                    Debug.Log($"[TOSS-DIAG]     overlap sphere but ComputePenetration = no penetration");
+                            }
+                            catch (System.Exception ex)
+                            {
+                                Debug.Log($"[TOSS-DIAG]     ComputePenetration threw: {ex.Message}");
+                            }
+                        }
+                    }
+                }
+                // ── END RELEASE DIAGNOSTIC ───────────────────────────────────
+
                 // Stamp position, then switch kinematic→non-kinematic BEFORE
                 // assigning velocity.  linearVelocity writes are silently ignored
                 // on kinematic bodies — the order matters.
@@ -1247,6 +2404,10 @@ public class gameplay : MonoBehaviour
                 _ballRb.useGravity                 = true;
                 _ballRb.linearVelocity             = tossVel;
                 _ballRb.angularVelocity            = Vector3.zero;
+
+                Debug.Log($"[TOSS-DIAG] POST-RELEASE linearVelocity={_ballRb.linearVelocity:F4}  " +
+                          $"isKinematic={_ballRb.isKinematic}  useGravity={_ballRb.useGravity}");
+
                 _servePhase           = ServePhase.Dropped;
                 _dropTime             = Time.time;
                 serveReady            = false;
@@ -1260,7 +2421,7 @@ public class gameplay : MonoBehaviour
                 float serveDistToNet = Mathf.Abs(ballInHand.z - _netZ);
                 float prepTime       = _serveGrabTime >= 0f
                                      ? Time.time - _serveGrabTime : 0f;
-                ExperimentLogger.Instance?.LogServe(serveDistToNet, prepTime);
+                ExperimentLogger.Instance?.LogServeStart();
 
                 Debug.Log($"[SERVE] Tossed vel={tossVel:F2}  ball.y={_ballRb.position.y:F2} " +
                           $"distToNet={serveDistToNet:F3} prep={prepTime:F2}s");
@@ -1273,10 +2434,14 @@ public class gameplay : MonoBehaviour
         {
             // Same kinematic-hold approach as Hidden→Held — prevents depenetration
             // fights with the playerside collider during re-grab.
+            // Zero velocity BEFORE setting kinematic (Unity 6 rejects writes after).
+            if (!_ballRb.isKinematic)
+            {
+                _ballRb.linearVelocity  = Vector3.zero;
+                _ballRb.angularVelocity = Vector3.zero;
+            }
             _ballRb.isKinematic     = true;
             _ballRb.useGravity      = false;
-            _ballRb.linearVelocity  = Vector3.zero;
-            _ballRb.angularVelocity = Vector3.zero;
             _ballRb.position        = ballInHand;
             _prevBallPosValid       = false;
             SetBallVisible(true);
