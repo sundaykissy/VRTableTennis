@@ -15,6 +15,12 @@ public class ballbounce : MonoBehaviour
     public static bool enemyFlag;
     public static bool resetFlag;
 
+    // ── Table contact event ───────────────────────────────────────────────────
+    // Fires on every validated table contact (playerside or enemyside).
+    // Args: collider name, ball world position at contact.
+    // Not currently subscribed by WoojerHapticManager — reserved for future use.
+    public static event System.Action<string, Vector3> OnTableBounce;
+
     // ── Game state ───────────────────────────────────────────────────────────
     // Training mode uses only two states:
     //   playerStart  — ball in hand, waiting to be served
@@ -33,8 +39,13 @@ public class ballbounce : MonoBehaviour
     // primary Y-velocity reflection.  These constants control only the spin
     // contribution applied in OnCollisionEnter.
     //
-    private const float TABLE_FRICTION = 0.25f;   // spin-to-horizontal transfer
-    private const float SPIN_DECAY     = 0.58f;   // how much spin is lost per bounce
+    // TABLE_FRICTION raised 0.25→0.30 (calibration pass): stronger spin-to-velocity
+    // kick at table contact makes topspin/backspin visibly distinguishable.
+    private const float TABLE_FRICTION = 0.30f;   // spin-to-horizontal transfer
+    // SPIN_DECAY raised 0.58→0.72 (calibration pass): spin now survives 72% through
+    // each bounce (was 58%), so backspin persists long enough to produce a visible
+    // check after the first table contact (was nearly gone by the second bounce).
+    private const float SPIN_DECAY     = 0.72f;   // fraction of spin retained per bounce
     private const float BALL_RADIUS    = 0.02f;   // real ping-pong ball radius (m)
     private const float MAGNUS_COEFF   = 5.5e-6f; // Magnus / topspin lift coefficient
 
@@ -71,7 +82,7 @@ public class ballbounce : MonoBehaviour
 
         _tableBounceClip = CreatePingClip(820f, 0.055f);
         _floorBounceClip = CreatePingClip(320f, 0.120f);
-        _netHitClip      = CreatePingClip(480f, 0.100f);
+        _netHitClip      = CreatePingClip(220f, 0.120f);
 
         _audio = GetComponent<AudioSource>();
         if (_audio == null) _audio = gameObject.AddComponent<AudioSource>();
@@ -296,23 +307,10 @@ public class ballbounce : MonoBehaviour
         // collider names, trigger setup, or collision detection mode.
         if (_prevVelY < -0.8f && velY > 0.1f)
         {
-            float ballY   = _ballRb.position.y;
-            float impactSpd = Mathf.Abs(_prevVelY);   // speed at impact
-
-            // Classify surface by height.
-            // Table surface is roughly 0.76 m in the scene; floor is near 0.
-            // Use 0.4 m as the split: above = table, below = floor.
-            bool isTableHeight = ballY > 0.4f;
-
-            Debug.Log($"[ballbounce] BounceDetected y={ballY:F2} prevVelY={_prevVelY:F2} " +
-                      $"velY={velY:F2} surface={(isTableHeight ? "TABLE" : "FLOOR")}");
-
-            if (isTableHeight)
-                PlaySound(_tableBounceClip, impactSpd, "TABLE");
-            else
-                PlaySound(_floorBounceClip, impactSpd, "FLOOR");
-
-            _lastBounceY = ballY;
+            // Bounce detected by velocity sign only for diagnostics/state support.
+            // Do NOT play audio here. Physical surface sounds are handled only by
+            // OnCollisionEnter so one bounce cannot produce duplicate sounds.
+            _lastBounceY = _ballRb.position.y;
         }
 
         _prevVelY = velY;
@@ -384,7 +382,7 @@ public class ballbounce : MonoBehaviour
         if (!_sessionWasActive)
         {
             _sessionWasActive = true;
-            ParkBallUnderground();
+            if (!gameplay.testModeActive) ParkBallUnderground();
             Debug.Log("[ballbounce] Session active — waiting for trigger.");
         }
 
@@ -469,18 +467,22 @@ public class ballbounce : MonoBehaviour
                     || nameLower.Contains("playerside") || nameLower.Contains("enemyside");
         if (isTable && _ballRb != null)
         {
-            float spd = _ballRb.linearVelocity.magnitude;
+            float  spd  = _ballRb.linearVelocity.magnitude;
+            string side = nameLower.Contains("playerside") ? "PlayerSide" : "OpponentSide";
 
-            // Compute actual ball penetration depth below the table surface.
-            // tableTopY = top face of the collider we just entered.
-            // Ideal contact: ball center is exactly BALL_RADIUS above tableTopY.
-            // Penetration = how far below that ideal the ball center currently is.
-            //   Positive = ball center sank below (tableTopY − BALL_RADIUS).
-            //   ~0       = perfect surface contact (no physics lag).
-            //   Negative = ball bounced early (centre still above surface — rare).
-            ExperimentLogger.Instance?.LogTableContact(
-                _curCol, spd, _ballRb.angularVelocity.magnitude);
-            PlaySound(_tableBounceClip, spd, "TABLE_trig");
+            // Fire OnTableBounce FIRST so ServeZoneClassifier stages the zone result
+            // inside ExperimentLogger before LogBallLanding reads it.
+            OnTableBounce?.Invoke(_curCol, _ballRb.position);
+
+            ExperimentLogger.Instance?.LogBallLanding(side, spd, _ballRb.angularVelocity.magnitude);
+
+            // OpponentSide landing ends the trial (logged after BallLanding row).
+            if (side == "OpponentSide")
+                ExperimentLogger.Instance?.LogTrialEnd();
+
+            // Audio is intentionally NOT played here. OnCollisionEnter is the single
+            // authoritative source for table/floor bounce sounds. This trigger path
+            // is kept for logging, OnTableBounce, and spin transfer only.
 
             // ── Spin-to-velocity transfer at table contact ────────────────────
             //
@@ -511,15 +513,22 @@ public class ballbounce : MonoBehaviour
         // ── Floor contact: audio only — ball bounces naturally ────────────────
         bool isFloor = nameLower == "floor" || nameLower.Contains("floor");
         if (isFloor && _ballRb != null)
-            PlaySound(_floorBounceClip, _ballRb.linearVelocity.magnitude, "FLOOR_trig");
+        {
+            float floorSpd = _ballRb.linearVelocity.magnitude;
+            // Audio is intentionally NOT played here. OnCollisionEnter handles floor sound.
+            ExperimentLogger.Instance?.LogBallLanding("Floor", floorSpd, _ballRb.angularVelocity.magnitude);
+            ExperimentLogger.Instance?.LogTrialEnd();
+        }
 
         // ── Net: audio only — no fault/scoring ───────────────────────────────
         bool isNet = _curCol == "Net" || nameLower.Contains("net");
         if (isNet)
         {
             PlaySound(_netHitClip, 3f, "NET");
-            // Training mode: net contact plays a sound but does not end the rally
-            // or award any point.  The ball continues bouncing naturally.
+            // Training mode: net contact plays a sound but does not end the rally.
+            if (_ballRb != null)
+                ExperimentLogger.Instance?.LogBallLanding(
+                    "Net", _ballRb.linearVelocity.magnitude, _ballRb.angularVelocity.magnitude);
             return;
         }
     }
@@ -529,19 +538,25 @@ public class ballbounce : MonoBehaviour
     {
         if (_audio == null)  { Debug.LogWarning("[ballbounce] PlaySound: _audio is NULL"); return; }
         if (clip == null)    { Debug.LogWarning("[ballbounce] PlaySound: clip is NULL");   return; }
-        if (Time.time - _lastBounceTime < 0.04f) return;
+
+        // Strong cooldown prevents stacked sounds from collision + net/floor/table
+        // events that can arrive in adjacent physics frames.
+        if (Time.time - _lastBounceTime < 0.12f) return;
         _lastBounceTime = Time.time;
 
-        float pitch  = Mathf.Clamp(0.85f + ballSpeed * 0.04f, 0.7f, 1.6f);
-        float volume = Mathf.Clamp(0.6f  + ballSpeed * 0.04f, 0.6f, 1.0f);
+        float pitch  = Mathf.Clamp(0.85f + ballSpeed * 0.04f, 0.75f, 1.35f);
+        float volume = Mathf.Clamp(0.45f + ballSpeed * 0.04f, 0.45f, 0.85f);
 
-        // PlayOneShot: fires a non-interruptible one-shot instance.
-        // Unlike Play(), it never cuts itself short if called rapidly.
-        _audio.pitch = pitch;
-        _audio.PlayOneShot(clip, volume);
+        // Do not use PlayOneShot here. Stop the previous clip so table/floor/net
+        // bounces cannot overlap into a doubled impact sound.
+        _audio.Stop();
+        _audio.clip   = clip;
+        _audio.pitch  = pitch;
+        _audio.volume = volume;
+        _audio.Play();
 
-        Debug.Log($"[ballbounce] SOUND PLAYED surface={surface} spd={ballSpeed:F1} " +
-                  $"vol={volume:F2} pitch={pitch:F2} clip={clip.name}");
+        Debug.Log($"[SOUND-DIAG] source=ballbounce.PlaySound  surface={surface}  spd={ballSpeed:F1}  " +
+                  $"vol={volume:F2}  pitch={pitch:F2}  clip={clip.name}  frame={Time.frameCount}");
     }
 
 }
